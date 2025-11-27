@@ -170,44 +170,62 @@ echo '{"tool":"boolean_cut","arguments":{"base":"Base","tool":"Hole","name":"Box
 echo '{"tool":"export_stl","arguments":{"path":"/tmp/box_with_hole.stl","objects":["BoxWithHole"]}}' | nc localhost 9876
 ```
 
-## Integration with Claude/Cursor
+## Integration with Cursor (MCP)
 
-For Cursor integration, you can create a wrapper script that translates MCP protocol to our TCP format. Create a file `freecad_mcp_bridge.py`:
+This addon includes a proper MCP bridge (`mcp_bridge.py`) that implements the Model Context Protocol, allowing Cursor to directly communicate with FreeCAD.
 
-```python
-#!/usr/bin/env python3
-"""Bridge between MCP stdio and FreeCAD TCP server."""
-import sys
-import json
-import socket
+### Setup
 
-def send_to_freecad(tool, arguments=None):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect(('localhost', 9876))
-    request = {"tool": tool, "arguments": arguments or {}}
-    sock.sendall((json.dumps(request) + "\n").encode())
-    response = sock.recv(65536).decode()
-    sock.close()
-    return response
+1. **Start FreeCAD** and run the TCP server:
+   ```python
+   from freecad_mcp import start_server
+   start_server()
+   ```
 
-# Read from stdin, send to FreeCAD, write to stdout
-for line in sys.stdin:
-    try:
-        request = json.loads(line)
-        # Handle MCP protocol format
-        if "method" in request:
-            if request["method"] == "tools/list":
-                result = send_to_freecad("list_tools")
-            elif request["method"] == "tools/call":
-                params = request.get("params", {})
-                result = send_to_freecad(params.get("name"), params.get("arguments"))
-            else:
-                result = json.dumps({"error": "Unknown method"})
-        else:
-            result = send_to_freecad(request.get("tool"), request.get("arguments"))
-        print(result, flush=True)
-    except Exception as e:
-        print(json.dumps({"error": str(e)}), flush=True)
+2. **Configure Cursor** - Create or edit `~/.cursor/mcp.json`:
+   ```json
+   {
+     "mcpServers": {
+       "freecad": {
+         "command": "python3",
+         "args": ["/Users/YOUR_USERNAME/Library/Application Support/FreeCAD/Mod/freecad_mcp/mcp_bridge.py"]
+       }
+     }
+   }
+   ```
+   
+   **For Linux:**
+   ```json
+   {
+     "mcpServers": {
+       "freecad": {
+         "command": "python3",
+         "args": ["/home/YOUR_USERNAME/.local/share/FreeCAD/Mod/freecad_mcp/mcp_bridge.py"]
+       }
+     }
+   }
+   ```
+
+3. **Restart Cursor** to load the MCP configuration
+
+### How It Works
+
+```
+┌─────────────┐     stdio      ┌─────────────┐     TCP:9876    ┌─────────────┐
+│   Cursor    │ ◄────────────► │ mcp_bridge  │ ◄─────────────► │  FreeCAD    │
+│  (Claude)   │   MCP Protocol │   .py       │   JSON requests │  TCP Server │
+└─────────────┘                └─────────────┘                 └─────────────┘
+```
+
+- **Cursor** speaks MCP protocol over stdio
+- **mcp_bridge.py** translates MCP to our simple JSON format
+- **FreeCAD TCP server** executes the tools and returns results
+
+### Testing the MCP Bridge
+
+```bash
+# Test that the bridge can connect to FreeCAD
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 mcp_bridge.py
 ```
 
 ## Stopping the Server
