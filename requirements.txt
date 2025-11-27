@@ -1,0 +1,7 @@
+# FreeCAD MCP Server dependencies
+# Install into FreeCAD's Python environment:
+# /path/to/FreeCAD/python -m pip install -r requirements.txt
+
+mcp>=1.0.0
+
+
