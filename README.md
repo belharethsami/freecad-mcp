@@ -136,6 +136,91 @@ You should see the shapes appear in FreeCAD's 3D viewport!
 | `export_step` | Export to STEP | `path`, `objects` (optional array) |
 | `save_document` | Save the document | `path` (optional) |
 | `recompute` | Recompute document | none |
+| `compare_to_stl` | Compare shapes to reference STL | `reference_path`, `tolerance` (optional) |
+| `get_mesh_points` | Export mesh as point cloud | `tessellation` (optional), `sample_rate` (optional) |
+
+### STL Comparison Tool
+
+The `compare_to_stl` tool compares current document shapes against a reference STL file using Hausdorff distance. **No additional packages required** - this works with just `freecad_mcp` and FreeCAD.
+
+#### Complete Test Example
+
+1. **Start FreeCAD** and run in the Python console:
+   ```python
+   from freecad_mcp import start_server
+   start_server()
+   ```
+
+2. **In a separate terminal**, run these commands:
+
+```bash
+# Create document and box
+echo '{"tool":"new_document","arguments":{"name":"Test"}}' | nc localhost 9876
+echo '{"tool":"create_box","arguments":{"length":50,"width":30,"height":20,"name":"RefBox"}}' | nc localhost 9876
+
+# Export to STL
+echo '{"tool":"export_stl","arguments":{"path":"/tmp/reference_box.stl"}}' | nc localhost 9876
+
+# Verify file exists
+ls -la /tmp/reference_box.stl
+
+# Compare current shapes to the reference (should match perfectly)
+echo '{"tool":"compare_to_stl","arguments":{"reference_path":"/tmp/reference_box.stl","tolerance":1.0}}' | nc localhost 9876
+```
+
+Expected response:
+```json
+{
+  "success": true,
+  "hausdorff_distance": 0.0,
+  "is_match": true,
+  "reference_volume": 30000.0,
+  "current_volume": 30000.0,
+  "volume_error": 0.0,
+  "area_error": 0.0
+}
+```
+
+#### Testing Shape Mismatch
+
+```bash
+# Delete and create wrong size box
+echo '{"tool":"delete_object","arguments":{"name":"RefBox"}}' | nc localhost 9876
+echo '{"tool":"create_box","arguments":{"length":40,"width":25,"height":15,"name":"WrongBox"}}' | nc localhost 9876
+
+# Compare - should show mismatch
+echo '{"tool":"compare_to_stl","arguments":{"reference_path":"/tmp/reference_box.stl","tolerance":1.0}}' | nc localhost 9876
+```
+
+This will return `"is_match": false` with non-zero `hausdorff_distance` and `volume_error`.
+
+#### Reloading After Code Changes
+
+If you modify `mcp_server.py`, reload without restarting FreeCAD:
+
+```python
+# In FreeCAD Python console
+from freecad_mcp import stop_server
+stop_server()
+
+import importlib
+from freecad_mcp import mcp_server
+importlib.reload(mcp_server)
+
+from freecad_mcp import start_server
+start_server()
+```
+
+#### Response Fields
+
+| Field | Description |
+|-------|-------------|
+| `hausdorff_distance` | Maximum geometric deviation in mm |
+| `volume_error` | Relative volume difference (0-1) |
+| `area_error` | Relative surface area difference (0-1) |
+| `is_match` | `true` if within tolerance |
+| `reference_volume` | Volume of reference STL (mm³) |
+| `current_volume` | Volume of current shapes (mm³) |
 
 ## Request Format
 
@@ -273,13 +358,86 @@ start_server(port=9877)
 
 ```
 freecad_mcp/
-├── __init__.py      # Main entry point
+├── __init__.py      # Main entry point, imports from mcp_server.py
 ├── Init.py          # FreeCAD headless init
 ├── InitGui.py       # GUI menu integration
-├── mcp_server.py    # TCP server and tools
-├── bridge.py        # Thread-safe execution
+├── mcp_server.py    # TCP server and ALL TOOLS (main file)
+├── bridge.py        # Thread-safe execution bridge
+├── mcp_bridge.py    # MCP protocol translation for Cursor
 ├── tools/           # (Tool modules - simplified)
 └── README.md        # This file
+```
+
+## Development Workflow
+
+### Understanding the Architecture
+
+FreeCAD loads addons from a **specific directory**, not your working directory:
+
+| OS | Addon Directory |
+|----|-----------------|
+| macOS | `~/Library/Application Support/FreeCAD/Mod/` |
+| Linux | `~/.local/share/FreeCAD/Mod/` |
+| Windows | `%APPDATA%\FreeCAD\Mod\` |
+
+The `freecad_mcp/` folder runs **inside FreeCAD** as an addon. If you also have `freecad_openenv/` (the RL environment), that runs **outside FreeCAD** and connects via TCP:
+
+```
+Your project:
+├── freecad_mcp/        ← Runs INSIDE FreeCAD (addon)
+│   └── mcp_server.py   ← Tools that FreeCAD executes
+│
+└── freecad_openenv/    ← Runs OUTSIDE FreeCAD (separate Python)
+    ├── environment.py  ← RL environment (connects via TCP)
+    └── mesh_rewards.py ← External mesh comparison
+```
+
+### Option 1: Symlink (Recommended)
+
+Create a symlink so FreeCAD always uses your development copy:
+
+```bash
+# macOS
+rm -rf ~/Library/Application\ Support/FreeCAD/Mod/freecad_mcp
+ln -s /path/to/your/project/freecad_mcp ~/Library/Application\ Support/FreeCAD/Mod/freecad_mcp
+
+# Linux
+rm -rf ~/.local/share/FreeCAD/Mod/freecad_mcp
+ln -s /path/to/your/project/freecad_mcp ~/.local/share/FreeCAD/Mod/freecad_mcp
+```
+
+With symlinks, changes are automatic - just restart FreeCAD or reload the module.
+
+### Option 2: Copy Changed Files
+
+If you modify `mcp_server.py` (where all tools are defined), copy just that file:
+
+```bash
+# macOS
+cp /path/to/your/project/freecad_mcp/mcp_server.py \
+   ~/Library/Application\ Support/FreeCAD/Mod/freecad_mcp/
+
+# Linux
+cp /path/to/your/project/freecad_mcp/mcp_server.py \
+   ~/.local/share/FreeCAD/Mod/freecad_mcp/
+```
+
+You only need to copy files you've changed. The other files (`__init__.py`, `bridge.py`, etc.) don't need updating if unchanged.
+
+### Reloading Without Restart
+
+After copying updated files, reload in FreeCAD's Python console:
+
+```python
+from freecad_mcp import stop_server
+stop_server()
+
+import importlib
+from freecad_mcp import mcp_server
+importlib.reload(mcp_server)
+
+from freecad_mcp import start_server
+start_server()
 ```
 
 ## License

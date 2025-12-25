@@ -89,6 +89,21 @@ TOOLS = {
         "description": "Recompute the document",
         "parameters": {}
     },
+    "compare_to_stl": {
+        "description": "Compare current document shapes to a reference STL file. Returns Hausdorff distance, volume/area comparison.",
+        "parameters": {
+            "reference_path": "string (path to reference STL file)",
+            "tolerance": "number (mm, optional, default 1.0)",
+            "tessellation": "number (mm, optional, tessellation accuracy, default 0.1)"
+        }
+    },
+    "get_mesh_points": {
+        "description": "Export current shapes as point cloud for external comparison",
+        "parameters": {
+            "tessellation": "number (mm, optional, default 0.1)",
+            "sample_rate": "number (optional, sample every Nth point, default 1)"
+        }
+    },
 }
 
 
@@ -208,18 +223,29 @@ def execute_tool(name: str, arguments: dict) -> dict:
         
         elif name == "export_stl":
             import Mesh
+            import MeshPart
             if doc is None:
                 return {"success": False, "error": "No active document"}
             objs = [doc.getObject(n) for n in arguments.get("objects", [])] if arguments.get("objects") else \
                    [o for o in doc.Objects if hasattr(o, "Shape")]
-            objs = [o for o in objs if o]
+            objs = [o for o in objs if o and hasattr(o, "Shape")]
             if not objs:
                 return {"success": False, "error": "No objects"}
-            mesh = Mesh.Mesh()
+            
+            # Use MeshPart to properly convert shapes to mesh
+            combined_mesh = Mesh.Mesh()
             for o in objs:
-                mesh.addMesh(Mesh.Mesh(o.Shape.tessellate(0.1)[0]))
-            mesh.write(arguments["path"])
-            return {"success": True, "path": arguments["path"]}
+                try:
+                    shape_mesh = MeshPart.meshFromShape(o.Shape, LinearDeflection=0.1)
+                    combined_mesh.addMesh(shape_mesh)
+                except Exception as e:
+                    FreeCAD.Console.PrintWarning(f"Failed to mesh {o.Name}: {e}\n")
+            
+            if combined_mesh.CountPoints == 0:
+                return {"success": False, "error": "Failed to create mesh from shapes"}
+            
+            combined_mesh.write(arguments["path"])
+            return {"success": True, "path": arguments["path"], "points": combined_mesh.CountPoints}
         
         elif name == "export_step":
             import Part
@@ -265,6 +291,156 @@ def execute_tool(name: str, arguments: dict) -> dict:
                 return {"success": False, "error": "No active document"}
             doc.recompute()
             return {"success": True}
+        
+        elif name == "compare_to_stl":
+            import Mesh
+            import os
+            
+            if doc is None:
+                return {"success": False, "error": "No active document"}
+            
+            ref_path = arguments.get("reference_path")
+            if not ref_path or not os.path.exists(ref_path):
+                return {"success": False, "error": f"Reference file not found: {ref_path}"}
+            
+            tolerance = arguments.get("tolerance", 1.0)
+            tess_accuracy = arguments.get("tessellation", 0.1)
+            
+            # Load reference STL
+            try:
+                ref_mesh = Mesh.Mesh(ref_path)
+            except Exception as e:
+                return {"success": False, "error": f"Failed to load reference STL: {e}"}
+            
+            ref_points = [[p.x, p.y, p.z] for p in ref_mesh.Points]
+            if not ref_points:
+                return {"success": False, "error": "Reference STL has no points"}
+            
+            # Get current shapes and tessellate
+            current_shapes = [o for o in doc.Objects if hasattr(o, "Shape") and o.Shape.Volume > 0]
+            if not current_shapes:
+                return {"success": False, "error": "No shapes in document"}
+            
+            current_points = []
+            current_volume = 0.0
+            current_area = 0.0
+            
+            for obj in current_shapes:
+                try:
+                    vertices, faces = obj.Shape.tessellate(tess_accuracy)
+                    for v in vertices:
+                        current_points.append([v.x, v.y, v.z])
+                    current_volume += obj.Shape.Volume
+                    current_area += obj.Shape.Area
+                except Exception as e:
+                    FreeCAD.Console.PrintWarning(f"Failed to tessellate {obj.Name}: {e}\n")
+            
+            if not current_points:
+                return {"success": False, "error": "Failed to tessellate current shapes"}
+            
+            # Compute Hausdorff distance (sample for speed)
+            import math
+            
+            def distance(p1, p2):
+                return math.sqrt(sum((a - b) ** 2 for a, b in zip(p1, p2)))
+            
+            def min_distance_to_set(point, point_set, sample_rate=10):
+                """Find minimum distance from point to any point in set."""
+                min_dist = float('inf')
+                for i, p in enumerate(point_set):
+                    if i % sample_rate == 0:  # Sample for speed
+                        d = distance(point, p)
+                        if d < min_dist:
+                            min_dist = d
+                return min_dist
+            
+            # Sample points for faster computation
+            sample_rate = max(1, len(ref_points) // 500)
+            sampled_ref = ref_points[::sample_rate]
+            sampled_current = current_points[::sample_rate]
+            
+            # Directed Hausdorff: ref -> current
+            max_ref_to_current = 0.0
+            for p in sampled_ref:
+                d = min_distance_to_set(p, current_points, sample_rate=1)
+                if d > max_ref_to_current:
+                    max_ref_to_current = d
+            
+            # Directed Hausdorff: current -> ref
+            max_current_to_ref = 0.0
+            for p in sampled_current:
+                d = min_distance_to_set(p, ref_points, sample_rate=1)
+                if d > max_current_to_ref:
+                    max_current_to_ref = d
+            
+            hausdorff = max(max_ref_to_current, max_current_to_ref)
+            
+            # Get reference mesh metrics
+            ref_volume = ref_mesh.Volume
+            ref_area = ref_mesh.Area
+            
+            # Compute errors
+            volume_error = abs(ref_volume - current_volume) / ref_volume if ref_volume > 0 else 0
+            area_error = abs(ref_area - current_area) / ref_area if ref_area > 0 else 0
+            
+            is_match = hausdorff <= tolerance and volume_error <= 0.05
+            
+            return {
+                "success": True,
+                "hausdorff_distance": round(hausdorff, 4),
+                "is_match": is_match,
+                "tolerance": tolerance,
+                "reference_volume": round(ref_volume, 2),
+                "current_volume": round(current_volume, 2),
+                "volume_error": round(volume_error, 4),
+                "reference_area": round(ref_area, 2),
+                "current_area": round(current_area, 2),
+                "area_error": round(area_error, 4),
+                "reference_points": len(ref_points),
+                "current_points": len(current_points),
+            }
+        
+        elif name == "get_mesh_points":
+            if doc is None:
+                return {"success": False, "error": "No active document"}
+            
+            tess_accuracy = arguments.get("tessellation", 0.1)
+            sample_rate = arguments.get("sample_rate", 1)
+            
+            current_shapes = [o for o in doc.Objects if hasattr(o, "Shape") and o.Shape.Volume > 0]
+            if not current_shapes:
+                return {"success": False, "error": "No shapes in document"}
+            
+            points = []
+            total_volume = 0.0
+            total_area = 0.0
+            bounds_min = [float('inf')] * 3
+            bounds_max = [float('-inf')] * 3
+            
+            for obj in current_shapes:
+                try:
+                    vertices, faces = obj.Shape.tessellate(tess_accuracy)
+                    for i, v in enumerate(vertices):
+                        if i % sample_rate == 0:
+                            points.append([round(v.x, 4), round(v.y, 4), round(v.z, 4)])
+                            for j in range(3):
+                                coord = [v.x, v.y, v.z][j]
+                                bounds_min[j] = min(bounds_min[j], coord)
+                                bounds_max[j] = max(bounds_max[j], coord)
+                    total_volume += obj.Shape.Volume
+                    total_area += obj.Shape.Area
+                except Exception as e:
+                    FreeCAD.Console.PrintWarning(f"Failed to tessellate {obj.Name}: {e}\n")
+            
+            return {
+                "success": True,
+                "points": points,
+                "point_count": len(points),
+                "volume": round(total_volume, 2),
+                "area": round(total_area, 2),
+                "bounds_min": [round(b, 2) for b in bounds_min],
+                "bounds_max": [round(b, 2) for b in bounds_max],
+            }
         
         elif name == "list_tools":
             return {"success": True, "tools": TOOLS}
