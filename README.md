@@ -470,6 +470,46 @@ Every successful tool call now includes a `screenshot` field in the response:
 
 This allows agents to see the result of each action without explicit screenshot requests.
 
+### Manual Testing (Terminal Commands)
+
+Test the view and screenshot tools manually before running the agent:
+
+```bash
+# 1. Create a document and import an STL
+echo '{"tool":"new_document","arguments":{"name":"Test"}}' | nc localhost 9876
+echo '{"tool":"import_stl","arguments":{"path":"/tmp/target_box_with_hole.stl","name":"Target"}}' | nc localhost 9876
+
+# 2. Test view presets
+echo '{"tool":"set_view","arguments":{"preset":"front"}}' | nc localhost 9876
+echo '{"tool":"set_view","arguments":{"preset":"isometric"}}' | nc localhost 9876
+echo '{"tool":"set_view","arguments":{"preset":"top"}}' | nc localhost 9876
+
+# 3. Test view rotation (rotate camera by degrees)
+echo '{"tool":"rotate_view","arguments":{"yaw":45}}' | nc localhost 9876
+echo '{"tool":"rotate_view","arguments":{"pitch":30}}' | nc localhost 9876
+echo '{"tool":"rotate_view","arguments":{"yaw":15,"pitch":15}}' | nc localhost 9876
+
+# 4. Test screenshot (save and decode to view)
+echo '{"tool":"take_screenshot","arguments":{"width":800,"height":600}}' | nc localhost 9876 | python3 -c "
+import sys, json, base64
+data = json.loads(sys.stdin.read())
+if data.get('screenshot'):
+    with open('/tmp/test_screenshot.png', 'wb') as f:
+        f.write(base64.b64decode(data['screenshot']))
+    print('Saved to /tmp/test_screenshot.png')
+else:
+    print('No screenshot:', data)
+"
+open /tmp/test_screenshot.png  # macOS: view the screenshot
+
+# 5. Test visibility toggle
+echo '{"tool":"set_visibility","arguments":{"name":"Target","visible":false}}' | nc localhost 9876
+echo '{"tool":"set_visibility","arguments":{"name":"Target","visible":true}}' | nc localhost 9876
+
+# 6. Test fit all
+echo '{"tool":"fit_all","arguments":{}}' | nc localhost 9876
+```
+
 ### Running the Visual Agent
 
 A complete test script is included in `freecad_openenv/examples/test_visual_agent.py`:
@@ -490,15 +530,32 @@ start_server()
 # Run the agent (in a separate terminal)
 cd freecad_openenv/examples
 
-# Using Anthropic Claude
-python test_visual_agent.py --target /tmp/target.stl --provider anthropic
+# Basic run (20 steps, Anthropic Claude)
+python test_visual_agent.py --target /tmp/target_box_with_hole.stl --provider anthropic
 
-# Using OpenAI GPT-4o
-python test_visual_agent.py --target /tmp/target.stl --provider openai
+# Extended run with more steps
+python test_visual_agent.py --target /tmp/target.stl --provider anthropic --max-steps 50
 
-# With more steps and save screenshots
-python test_visual_agent.py --target /tmp/target.stl --provider anthropic --max-steps 25 --save-screenshots --verbose
+# OpenAI GPT-4o
+python test_visual_agent.py --target /tmp/target.stl --provider openai --max-steps 30
+
+# Verbose output (shows full JSON results)
+python test_visual_agent.py --target /tmp/target.stl --provider anthropic --verbose
+
+# Disable session logging
+python test_visual_agent.py --target /tmp/target.stl --provider anthropic --no-log
+
+# All options
+python test_visual_agent.py --target /tmp/target.stl --provider anthropic --max-steps 40 --verbose
 ```
+
+### Session Logs
+
+By default, all agent runs are logged to `agent_sessions/session_YYYYMMDD_HHMMSS/`:
+- `session.json` - Raw log data
+- `session.md` - Markdown with image links
+- `session.html` - HTML viewable in browser
+- `images/` - All screenshots as PNG files
 
 ### Creating a Test Target
 
