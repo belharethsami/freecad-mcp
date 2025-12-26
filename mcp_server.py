@@ -3,12 +3,16 @@
 FreeCAD MCP Server - Main server implementation
 
 Uses a simple JSON-RPC server over TCP for communication with LLM clients.
+Includes automatic screenshot capture after every tool call for visual feedback.
 """
 
 import asyncio
 import threading
 import json
 import socket
+import base64
+import tempfile
+import os
 from typing import Optional, Tuple, List
 
 import FreeCAD
@@ -22,6 +26,91 @@ _bridge: Optional[MainThreadBridge] = None
 _server_thread: Optional[threading.Thread] = None
 
 DEFAULT_PORT = 9876
+
+# Screenshot settings
+_auto_screenshot_enabled = True
+_screenshot_width = 800
+_screenshot_height = 600
+
+
+def has_gui() -> bool:
+    """Check if FreeCAD GUI is available."""
+    try:
+        import FreeCADGui
+        return FreeCADGui.ActiveDocument is not None or FreeCAD.ActiveDocument is not None
+    except (ImportError, AttributeError):
+        return False
+
+
+def capture_viewport_base64(width: int = None, height: int = None, background: str = "White") -> Optional[str]:
+    """
+    Capture current viewport as base64-encoded PNG.
+    
+    Args:
+        width: Image width in pixels (default: 800)
+        height: Image height in pixels (default: 600)
+        background: Background color ("White", "Black", "Transparent")
+    
+    Returns:
+        Base64-encoded PNG string, or None if capture fails
+    """
+    if width is None:
+        width = _screenshot_width
+    if height is None:
+        height = _screenshot_height
+    
+    try:
+        import FreeCADGui
+        from PySide2 import QtCore, QtWidgets
+        
+        # Ensure there's an active view
+        if FreeCADGui.ActiveDocument is None:
+            FreeCAD.Console.PrintWarning("Screenshot: No active GUI document\n")
+            return None
+        
+        view = FreeCADGui.ActiveDocument.ActiveView
+        if view is None:
+            FreeCAD.Console.PrintWarning("Screenshot: No active view\n")
+            return None
+        
+        # Force GUI update before capturing
+        QtWidgets.QApplication.processEvents()
+        view.fitAll()
+        QtWidgets.QApplication.processEvents()
+        
+        # Create temp file for screenshot
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        
+        try:
+            # Save screenshot to file
+            # Use "Current" to capture exactly what's on screen
+            view.saveImage(path, width, height, "Current")
+            
+            # Verify file was created and has content
+            if os.path.exists(path) and os.path.getsize(path) > 100:
+                with open(path, "rb") as f:
+                    image_data = f.read()
+                return base64.b64encode(image_data).decode('utf-8')
+            else:
+                FreeCAD.Console.PrintWarning(f"Screenshot: File empty or not created\n")
+                return None
+        finally:
+            # Clean up temp file
+            if os.path.exists(path):
+                os.remove(path)
+                
+    except Exception as e:
+        FreeCAD.Console.PrintWarning(f"Screenshot capture failed: {e}\n")
+        return None
+
+
+def set_auto_screenshot(enabled: bool, width: int = 800, height: int = 600):
+    """Configure automatic screenshot settings."""
+    global _auto_screenshot_enabled, _screenshot_width, _screenshot_height
+    _auto_screenshot_enabled = enabled
+    _screenshot_width = width
+    _screenshot_height = height
 
 # Tool definitions
 TOOLS = {
@@ -102,6 +191,47 @@ TOOLS = {
         "parameters": {
             "tessellation": "number (mm, optional, default 0.1)",
             "sample_rate": "number (optional, sample every Nth point, default 1)"
+        }
+    },
+    # === View and Screenshot Tools ===
+    "take_screenshot": {
+        "description": "Take a manual screenshot with custom settings (auto-screenshots use defaults)",
+        "parameters": {
+            "width": "number (optional, default 800)",
+            "height": "number (optional, default 600)",
+            "background": "string (optional: 'White', 'Black', 'Transparent', default 'White')"
+        }
+    },
+    "set_view": {
+        "description": "Set camera to a preset view angle",
+        "parameters": {
+            "preset": "string (front/back/top/bottom/left/right/isometric)"
+        }
+    },
+    "fit_all": {
+        "description": "Fit camera to show all objects in the viewport",
+        "parameters": {}
+    },
+    "import_stl": {
+        "description": "Import an STL file as a visible mesh object (for reference/target)",
+        "parameters": {
+            "path": "string (path to STL file)",
+            "name": "string (optional, object name)"
+        }
+    },
+    "set_visibility": {
+        "description": "Show or hide objects in the viewport",
+        "parameters": {
+            "name": "string (object name, or '*' for all objects)",
+            "visible": "boolean"
+        }
+    },
+    "rotate_view": {
+        "description": "Rotate the camera view by specified angles",
+        "parameters": {
+            "yaw": "number (degrees, rotation around Z axis, optional)",
+            "pitch": "number (degrees, rotation around X axis, optional)",
+            "roll": "number (degrees, rotation around Y axis, optional)"
         }
     },
 }
@@ -442,13 +572,201 @@ def execute_tool(name: str, arguments: dict) -> dict:
                 "bounds_max": [round(b, 2) for b in bounds_max],
             }
         
+        elif name == "take_screenshot":
+            width = arguments.get("width", _screenshot_width)
+            height = arguments.get("height", _screenshot_height)
+            background = arguments.get("background", "White")
+            
+            screenshot = capture_viewport_base64(width, height, background)
+            if screenshot:
+                return {"success": True, "screenshot": screenshot, "width": width, "height": height}
+            else:
+                return {"success": False, "error": "Failed to capture screenshot (GUI may not be available)"}
+        
+        elif name == "set_view":
+            try:
+                import FreeCADGui
+                from PySide2 import QtWidgets
+                
+                if FreeCADGui.ActiveDocument is None:
+                    return {"success": False, "error": "No active document with view"}
+                
+                view = FreeCADGui.ActiveDocument.ActiveView
+                preset = arguments.get("preset", "isometric").lower()
+                
+                # Use FreeCAD's built-in view methods
+                if preset == "front":
+                    view.viewFront()
+                elif preset == "back":
+                    view.viewRear()
+                elif preset == "top":
+                    view.viewTop()
+                elif preset == "bottom":
+                    view.viewBottom()
+                elif preset == "left":
+                    view.viewLeft()
+                elif preset == "right":
+                    view.viewRight()
+                elif preset == "isometric":
+                    view.viewIsometric()
+                else:
+                    return {"success": False, "error": f"Unknown view preset: {preset}. Use: front/back/top/bottom/left/right/isometric"}
+                
+                # Fit all and update
+                view.fitAll()
+                QtWidgets.QApplication.processEvents()
+                
+                return {"success": True, "view": preset}
+            except Exception as e:
+                return {"success": False, "error": f"Failed to set view: {e}"}
+        
+        elif name == "fit_all":
+            try:
+                import FreeCADGui
+                from PySide2 import QtWidgets
+                
+                if FreeCADGui.ActiveDocument is None:
+                    return {"success": False, "error": "No active document with view"}
+                
+                view = FreeCADGui.ActiveDocument.ActiveView
+                view.fitAll()
+                QtWidgets.QApplication.processEvents()
+                
+                return {"success": True}
+            except Exception as e:
+                return {"success": False, "error": f"Failed to fit view: {e}"}
+        
+        elif name == "import_stl":
+            import Mesh
+            import os as os_module  # Local import to avoid scoping issues
+            
+            stl_path = arguments.get("path")
+            if not stl_path:
+                return {"success": False, "error": "Path is required"}
+            
+            if not os_module.path.exists(stl_path):
+                return {"success": False, "error": f"File not found: {stl_path}"}
+            
+            if doc is None:
+                doc = FreeCAD.newDocument("Unnamed")
+            
+            try:
+                # Import the STL mesh
+                mesh_obj = Mesh.insert(stl_path, doc.Name)
+                
+                # Find the imported object (it's the last mesh object added)
+                mesh_objects = [o for o in doc.Objects if o.TypeId == "Mesh::Feature"]
+                if mesh_objects:
+                    imported = mesh_objects[-1]
+                    obj_name = arguments.get("name")
+                    if obj_name:
+                        imported.Label = obj_name
+                    
+                    # Fit view to show the imported object
+                    try:
+                        import FreeCADGui
+                        if FreeCADGui.ActiveDocument:
+                            FreeCADGui.ActiveDocument.ActiveView.fitAll()
+                    except:
+                        pass
+                    
+                    return {
+                        "success": True,
+                        "name": imported.Name,
+                        "label": imported.Label,
+                        "points": imported.Mesh.CountPoints,
+                        "facets": imported.Mesh.CountFacets
+                    }
+                else:
+                    return {"success": False, "error": "Failed to import mesh"}
+            except Exception as e:
+                return {"success": False, "error": f"Failed to import STL: {e}"}
+        
+        elif name == "set_visibility":
+            try:
+                import FreeCADGui
+                
+                if doc is None:
+                    return {"success": False, "error": "No active document"}
+                
+                obj_name = arguments.get("name")
+                visible = arguments.get("visible", True)
+                
+                if obj_name == "*":
+                    # Set visibility for all objects
+                    count = 0
+                    for obj in doc.Objects:
+                        if hasattr(obj, "ViewObject") and obj.ViewObject:
+                            obj.ViewObject.Visibility = visible
+                            count += 1
+                    return {"success": True, "objects_affected": count, "visible": visible}
+                else:
+                    obj = doc.getObject(obj_name)
+                    if not obj:
+                        return {"success": False, "error": f"Object not found: {obj_name}"}
+                    
+                    if hasattr(obj, "ViewObject") and obj.ViewObject:
+                        obj.ViewObject.Visibility = visible
+                        return {"success": True, "name": obj_name, "visible": visible}
+                    else:
+                        return {"success": False, "error": f"Object has no ViewObject: {obj_name}"}
+            except Exception as e:
+                return {"success": False, "error": f"Failed to set visibility: {e}"}
+        
+        elif name == "rotate_view":
+            try:
+                import FreeCADGui
+                from PySide2 import QtWidgets
+                
+                if FreeCADGui.ActiveDocument is None:
+                    return {"success": False, "error": "No active document with view"}
+                
+                view = FreeCADGui.ActiveDocument.ActiveView
+                
+                yaw = arguments.get("yaw", 0)
+                pitch = arguments.get("pitch", 0)
+                roll = arguments.get("roll", 0)
+                
+                # Get current orientation and apply rotations
+                current_rot = view.getCameraOrientation()
+                
+                # Apply rotations (yaw around Z, pitch around X, roll around Y)
+                if yaw != 0:
+                    rot_z = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), yaw)
+                    current_rot = rot_z.multiply(current_rot)
+                if pitch != 0:
+                    rot_x = FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), pitch)
+                    current_rot = rot_x.multiply(current_rot)
+                if roll != 0:
+                    rot_y = FreeCAD.Rotation(FreeCAD.Vector(0, 1, 0), roll)
+                    current_rot = rot_y.multiply(current_rot)
+                
+                view.setCameraOrientation(current_rot)
+                QtWidgets.QApplication.processEvents()
+                
+                return {"success": True, "yaw": yaw, "pitch": pitch, "roll": roll}
+            except Exception as e:
+                return {"success": False, "error": f"Failed to rotate view: {e}"}
+        
         elif name == "list_tools":
             return {"success": True, "tools": TOOLS}
         
         else:
             return {"success": False, "error": f"Unknown tool: {name}"}
     
-    return _bridge.execute_sync(_execute)
+    # Execute the tool
+    result = _bridge.execute_sync(_execute)
+    
+    # Auto-append screenshot to successful responses (if GUI available)
+    if _auto_screenshot_enabled and result.get("success", False):
+        # Skip screenshot for list_tools and get_mesh_points (large data responses)
+        skip_screenshot_tools = {"list_tools", "get_mesh_points", "take_screenshot"}
+        if name not in skip_screenshot_tools:
+            screenshot = capture_viewport_base64()
+            if screenshot:
+                result["screenshot"] = screenshot
+    
+    return result
 
 
 class SimpleMCPServer:

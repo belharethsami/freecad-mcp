@@ -440,6 +440,116 @@ from freecad_mcp import start_server
 start_server()
 ```
 
+## Visual Agent Testing
+
+The MCP server includes **automatic screenshot capture** after every tool call, enabling vision-based agents (Claude, GPT-4o) to see and iterate on 3D models.
+
+### New View and Screenshot Tools
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `take_screenshot` | Manual screenshot with custom settings | `width`, `height`, `background` |
+| `set_view` | Set camera to preset angle | `preset` (front/back/top/bottom/left/right/isometric) |
+| `fit_all` | Fit camera to show all objects | none |
+| `import_stl` | Import STL as visible mesh | `path`, `name` (optional) |
+| `set_visibility` | Show/hide objects | `name` (or `*` for all), `visible` |
+| `rotate_view` | Rotate camera by angles | `yaw`, `pitch`, `roll` (degrees) |
+
+### Auto-Screenshots
+
+Every successful tool call now includes a `screenshot` field in the response:
+
+```json
+{
+  "success": true,
+  "name": "Box",
+  "volume": 30000.0,
+  "screenshot": "iVBORw0KGgoAAAANSUhEUg..."  // base64 PNG
+}
+```
+
+This allows agents to see the result of each action without explicit screenshot requests.
+
+### Running the Visual Agent
+
+A complete test script is included in `freecad_openenv/examples/test_visual_agent.py`:
+
+```bash
+# Prerequisites
+pip install anthropic openai
+
+# Set your API key
+export ANTHROPIC_API_KEY="sk-ant-..."
+# or
+export OPENAI_API_KEY="sk-..."
+
+# Start FreeCAD with MCP server (in FreeCAD Python console):
+from freecad_mcp import start_server
+start_server()
+
+# Run the agent (in a separate terminal)
+cd freecad_openenv/examples
+
+# Using Anthropic Claude
+python test_visual_agent.py --target /tmp/target.stl --provider anthropic
+
+# Using OpenAI GPT-4o
+python test_visual_agent.py --target /tmp/target.stl --provider openai
+
+# With more steps and save screenshots
+python test_visual_agent.py --target /tmp/target.stl --provider anthropic --max-steps 25 --save-screenshots --verbose
+```
+
+### Creating a Test Target
+
+Generate a simple test STL in FreeCAD:
+
+```python
+# In FreeCAD Python console
+import Part, Mesh, MeshPart
+
+# Create a box with a hole
+box = Part.makeBox(50, 30, 20)
+cyl = Part.makeCylinder(8, 30, FreeCAD.Vector(25, 15, 0))
+shape = box.cut(cyl)
+
+# Export as mesh
+mesh = MeshPart.meshFromShape(shape, LinearDeflection=0.1)
+mesh.write("/tmp/target_box_with_hole.stl")
+print("Saved to /tmp/target_box_with_hole.stl")
+```
+
+### Expected Agent Workflow
+
+```
+[Step 0] Loaded target: /tmp/target_box_with_hole.stl
+[Step 1] Agent: set_view(preset="isometric")
+         Result: success
+[Step 2] Agent: get_object_info(name="TargetMesh")
+         Result: bounds: [0, 0, 0] to [50, 30, 20]
+[Step 3] Agent: create_box(length=50, width=30, height=20, name="Base")
+         Result: success, volume=30000
+[Step 4] Agent: create_cylinder(radius=8, height=30, name="Hole")
+         Result: success
+[Step 5] Agent: move_object(name="Hole", x=25, y=15, z=0)
+         Result: success
+[Step 6] Agent: boolean_cut(base="Base", tool="Hole", name="Result")
+         Result: success, volume=23968.14
+[Step 7] Agent: compare_to_stl(reference_path="/tmp/target_box_with_hole.stl")
+         Result: hausdorff=0.12, is_match=true
+
+SUCCESS! Replicated target in 7 steps.
+```
+
+### Cost Estimates
+
+| Provider | Model | Cost per Step (approx) |
+|----------|-------|----------------------|
+| Anthropic | claude-sonnet-4-20250514 | ~$0.01-0.02 |
+| OpenAI | gpt-4o | ~$0.01-0.02 |
+
+A typical 20-step run costs approximately $0.20-0.40.
+
 ## License
 
 LGPL-2.1-or-later (same as FreeCAD)
