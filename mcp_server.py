@@ -147,9 +147,7 @@ def capture_viewport_base64(width: int = None, height: int = None, background: s
             FreeCAD.Console.PrintWarning("Screenshot: No active view\n")
             return None
         
-        # Force GUI update before capturing
-        QtWidgets.QApplication.processEvents()
-        view.fitAll()
+        # Force GUI update before capturing (do not change camera/zoom)
         QtWidgets.QApplication.processEvents()
         
         # Create temp file for screenshot
@@ -217,8 +215,7 @@ def capture_document_viewport(doc_name: str, width: int = None, height: int = No
             FreeCAD.Console.PrintWarning(f"Screenshot: No active view for {doc_name}\n")
             return None
         
-        # Force GUI update before capturing
-        view.fitAll()
+        # Force GUI update before capturing (do not change camera/zoom)
         QtWidgets.QApplication.processEvents()
         
         # Create temp file for screenshot
@@ -1893,6 +1890,10 @@ def execute_tool(name: str, arguments: dict) -> dict:
             try:
                 import FreeCADGui
                 from PySide2 import QtWidgets
+                import math
+
+                if not getattr(FreeCAD, "GuiUp", False):
+                    return {"success": False, "error": "Zoom requires FreeCAD GUI. Start FreeCAD (not FreeCADCmd/headless) and try again."}
                 
                 percent = arguments.get("percent", 100)
                 doc_param = arguments.get("doc", "work" if is_dual_mode() else None)
@@ -1901,28 +1902,25 @@ def execute_tool(name: str, arguments: dict) -> dict:
                     return {"success": False, "error": "Zoom percent must be positive"}
                 
                 def apply_zoom(view, zoom_percent):
-                    """Apply zoom to a view."""
-                    cam = view.getCameraNode()
-                    if cam is None:
-                        return False
-                    
-                    # For orthographic camera, adjust height
-                    # For perspective camera, adjust position
-                    try:
-                        current_height = cam.height.getValue()
-                        # Smaller height = more zoomed in
-                        new_height = current_height * (100.0 / zoom_percent)
-                        cam.height.setValue(new_height)
+                    """Apply zoom using the navigation style (avoids direct Coin camera access)."""
+                    if zoom_percent == 100:
                         return True
-                    except:
-                        # Try perspective zoom by moving camera
-                        try:
-                            pos = list(cam.position.getValue())
-                            factor = 100.0 / zoom_percent
-                            cam.position.setValue(pos[0] * factor, pos[1] * factor, pos[2] * factor)
-                            return True
-                        except:
-                            return False
+                    
+                    factor = zoom_percent / 100.0
+                    # Empirical step factor similar to mouse wheel zoom
+                    step_factor = 1.1
+                    steps = max(1, int(abs(math.log(factor) / math.log(step_factor)) + 0.5))
+                    
+                    try:
+                        for _ in range(steps):
+                            if factor > 1.0:
+                                view.zoomIn()
+                            else:
+                                view.zoomOut()
+                        return True
+                    except Exception as e:
+                        FreeCAD.Console.PrintWarning(f"Zoom failed: {e}\n")
+                        return False
                 
                 # Determine which documents to apply zoom to
                 docs_to_update = []
@@ -1958,44 +1956,34 @@ def execute_tool(name: str, arguments: dict) -> dict:
             try:
                 import FreeCADGui
                 from PySide2 import QtWidgets
+
+                if not getattr(FreeCAD, "GuiUp", False):
+                    return {"success": False, "error": "Pan requires FreeCAD GUI. Start FreeCAD (not FreeCADCmd/headless) and try again."}
                 
                 x_percent = arguments.get("x", 0)
                 y_percent = arguments.get("y", 0)
                 doc_param = arguments.get("doc", "work" if is_dual_mode() else None)
                 
                 def apply_pan(view, pan_x, pan_y):
-                    """Apply pan to a view."""
-                    cam = view.getCameraNode()
-                    if cam is None:
-                        return False
-                    
+                    """Apply pan using camera placement (avoids direct Coin camera access)."""
                     try:
-                        # Get current camera height (viewport size indicator)
-                        height = cam.height.getValue()
+                        current_pl = view.viewPosition()  # returns FreeCAD.Placement
+                        if not current_pl:
+                            return False
                         
-                        # Calculate pan in world units
-                        # Approximate aspect ratio
-                        try:
-                            view_size = view.getSize()
-                            aspect = view_size[0] / view_size[1] if view_size[1] > 0 else 1.5
-                        except:
-                            aspect = 1.5
+                        # Scene scale to keep pan movement reasonable
+                        bbox = get_scene_bounding_box()
+                        scene_span = max(bbox["size"]) if bbox else 100.0
+                        scale = scene_span * 0.01  # 1% of span per 1% pan input
                         
-                        pan_world_x = height * aspect * (pan_x / 100.0)
-                        pan_world_y = height * (pan_y / 100.0)
+                        right = current_pl.Rotation.multVec(FreeCAD.Vector(1, 0, 0))
+                        up = current_pl.Rotation.multVec(FreeCAD.Vector(0, 1, 0))
                         
-                        # Get camera orientation to pan in view-relative direction
-                        orientation = view.getCameraOrientation()
-                        right = orientation.multVec(FreeCAD.Vector(1, 0, 0))
-                        up = orientation.multVec(FreeCAD.Vector(0, 1, 0))
+                        offset = right * (pan_x * scale) + up * (pan_y * scale)
+                        new_pos = current_pl.Base + offset
                         
-                        # Calculate offset
-                        offset = right * pan_world_x + up * pan_world_y
-                        
-                        # Apply to camera position
-                        pos = cam.position.getValue()
-                        cam.position.setValue(pos[0] + offset.x, pos[1] + offset.y, pos[2] + offset.z)
-                        
+                        new_pl = FreeCAD.Placement(new_pos, current_pl.Rotation)
+                        view.viewPosition(new_pl)
                         return True
                     except Exception as e:
                         FreeCAD.Console.PrintWarning(f"Pan failed: {e}\n")
