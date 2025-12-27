@@ -4,4 +4,6 @@
 
 mcp>=1.0.0
 
+# For split-screen dual document view (side-by-side image merging)
+Pillow>=9.0.0
 

@@ -32,6 +32,53 @@ _auto_screenshot_enabled = True
 _screenshot_width = 800
 _screenshot_height = 600
 
+# Dual document state for split-screen view
+_target_doc_name: Optional[str] = None
+_work_doc_name: Optional[str] = None
+_dual_mode_enabled: bool = False
+
+
+def is_dual_mode() -> bool:
+    """Check if dual document mode is active."""
+    return _dual_mode_enabled and _target_doc_name is not None and _work_doc_name is not None
+
+
+def get_target_doc():
+    """Get the target document (contains reference STL)."""
+    if _target_doc_name:
+        return FreeCAD.getDocument(_target_doc_name)
+    return None
+
+
+def get_work_doc():
+    """Get the work document (where agent creates objects)."""
+    if _work_doc_name:
+        return FreeCAD.getDocument(_work_doc_name)
+    return FreeCAD.ActiveDocument
+
+
+def activate_document(doc_name: str) -> bool:
+    """Activate a document by name, returns True if successful."""
+    try:
+        import FreeCADGui
+        doc = FreeCAD.getDocument(doc_name)
+        if doc:
+            FreeCAD.setActiveDocument(doc_name)
+            if FreeCADGui.ActiveDocument is None or FreeCADGui.ActiveDocument.Document.Name != doc_name:
+                FreeCADGui.setActiveDocument(doc_name)
+            return True
+    except Exception as e:
+        FreeCAD.Console.PrintWarning(f"Failed to activate document {doc_name}: {e}\n")
+    return False
+
+
+def reset_dual_mode():
+    """Reset dual document mode state."""
+    global _target_doc_name, _work_doc_name, _dual_mode_enabled
+    _target_doc_name = None
+    _work_doc_name = None
+    _dual_mode_enabled = False
+
 
 def has_gui() -> bool:
     """Check if FreeCAD GUI is available."""
@@ -105,6 +152,192 @@ def capture_viewport_base64(width: int = None, height: int = None, background: s
         return None
 
 
+def capture_document_viewport(doc_name: str, width: int = None, height: int = None) -> Optional[str]:
+    """
+    Capture viewport of a specific document as base64-encoded PNG.
+    
+    Args:
+        doc_name: Name of the document to capture
+        width: Image width in pixels
+        height: Image height in pixels
+    
+    Returns:
+        Base64-encoded PNG string, or None if capture fails
+    """
+    if width is None:
+        width = _screenshot_width
+    if height is None:
+        height = _screenshot_height
+    
+    try:
+        import FreeCADGui
+        from PySide2 import QtWidgets
+        
+        # Activate the target document
+        if not activate_document(doc_name):
+            FreeCAD.Console.PrintWarning(f"Screenshot: Cannot activate document {doc_name}\n")
+            return None
+        
+        QtWidgets.QApplication.processEvents()
+        
+        gui_doc = FreeCADGui.getDocument(doc_name)
+        if gui_doc is None:
+            FreeCAD.Console.PrintWarning(f"Screenshot: No GUI document for {doc_name}\n")
+            return None
+        
+        view = gui_doc.ActiveView
+        if view is None:
+            FreeCAD.Console.PrintWarning(f"Screenshot: No active view for {doc_name}\n")
+            return None
+        
+        # Force GUI update before capturing
+        view.fitAll()
+        QtWidgets.QApplication.processEvents()
+        
+        # Create temp file for screenshot
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        
+        try:
+            view.saveImage(path, width, height, "Current")
+            
+            if os.path.exists(path) and os.path.getsize(path) > 100:
+                with open(path, "rb") as f:
+                    image_data = f.read()
+                return base64.b64encode(image_data).decode('utf-8')
+            else:
+                return None
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+                
+    except Exception as e:
+        FreeCAD.Console.PrintWarning(f"Screenshot capture for {doc_name} failed: {e}\n")
+        return None
+
+
+def capture_split_view(width: int = None, height: int = None, label_height: int = 30) -> Optional[str]:
+    """
+    Capture both target and work documents and merge them side-by-side with labels.
+    
+    Args:
+        width: Width of each individual image (total will be 2x this + gap)
+        height: Height of each individual image
+        label_height: Height of the label bar at the top of each image
+    
+    Returns:
+        Base64-encoded PNG of the merged side-by-side image, or None if capture fails
+    """
+    if not is_dual_mode():
+        # Fall back to single viewport capture
+        return capture_viewport_base64(width, height)
+    
+    if width is None:
+        width = _screenshot_width // 2  # Each panel is half width
+    if height is None:
+        height = _screenshot_height
+    
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import io
+        
+        # Remember current active document
+        original_active = FreeCAD.ActiveDocument.Name if FreeCAD.ActiveDocument else None
+        
+        # Capture target document
+        target_b64 = capture_document_viewport(_target_doc_name, width, height)
+        
+        # Capture work document
+        work_b64 = capture_document_viewport(_work_doc_name, width, height)
+        
+        # Restore original active document
+        if original_active:
+            activate_document(original_active)
+        
+        if not target_b64 and not work_b64:
+            return None
+        
+        # Create placeholder images if one capture failed
+        def create_placeholder(w, h, text):
+            img = Image.new('RGB', (w, h), color=(200, 200, 200))
+            draw = ImageDraw.Draw(img)
+            try:
+                # Try to center the text
+                bbox = draw.textbbox((0, 0), text)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+                x = (w - text_w) // 2
+                y = (h - text_h) // 2
+                draw.text((x, y), text, fill=(100, 100, 100))
+            except:
+                draw.text((10, h // 2), text, fill=(100, 100, 100))
+            return img
+        
+        # Decode images
+        if target_b64:
+            target_img = Image.open(io.BytesIO(base64.b64decode(target_b64)))
+        else:
+            target_img = create_placeholder(width, height, "Target: No view")
+        
+        if work_b64:
+            work_img = Image.open(io.BytesIO(base64.b64decode(work_b64)))
+        else:
+            work_img = create_placeholder(width, height, "Work: No view")
+        
+        # Ensure both images have the same size
+        target_img = target_img.resize((width, height))
+        work_img = work_img.resize((width, height))
+        
+        # Create combined image with labels
+        gap = 4  # Gap between images
+        total_width = width * 2 + gap
+        total_height = height + label_height
+        
+        combined = Image.new('RGB', (total_width, total_height), color=(40, 40, 40))
+        draw = ImageDraw.Draw(combined)
+        
+        # Draw labels
+        target_label = "TARGET (Reference)"
+        work_label = "YOUR CREATION"
+        
+        # Target label (left side)
+        try:
+            bbox = draw.textbbox((0, 0), target_label)
+            text_w = bbox[2] - bbox[0]
+            x = (width - text_w) // 2
+        except:
+            x = 10
+        draw.text((x, 5), target_label, fill=(255, 200, 100))
+        
+        # Work label (right side)
+        try:
+            bbox = draw.textbbox((0, 0), work_label)
+            text_w = bbox[2] - bbox[0]
+            x = width + gap + (width - text_w) // 2
+        except:
+            x = width + gap + 10
+        draw.text((x, 5), work_label, fill=(100, 200, 255))
+        
+        # Paste images
+        combined.paste(target_img, (0, label_height))
+        combined.paste(work_img, (width + gap, label_height))
+        
+        # Encode to base64
+        buffer = io.BytesIO()
+        combined.save(buffer, format='PNG')
+        buffer.seek(0)
+        
+        return base64.b64encode(buffer.read()).decode('utf-8')
+        
+    except ImportError:
+        FreeCAD.Console.PrintWarning("PIL/Pillow not available for split view. Install with: pip install Pillow\n")
+        # Fall back to work document view only
+        return capture_document_viewport(_work_doc_name, width, height) if _work_doc_name else capture_viewport_base64(width, height)
+    except Exception as e:
+        FreeCAD.Console.PrintWarning(f"Split view capture failed: {e}\n")
+        return capture_viewport_base64(width, height)
+
+
 def set_auto_screenshot(enabled: bool, width: int = 800, height: int = 600):
     """Configure automatic screenshot settings."""
     global _auto_screenshot_enabled, _screenshot_width, _screenshot_height
@@ -114,6 +347,14 @@ def set_auto_screenshot(enabled: bool, width: int = 800, height: int = 600):
 
 # Tool definitions
 TOOLS = {
+    "setup_dual_docs": {
+        "description": "Initialize dual-document mode: creates TargetDoc (with reference STL) and WorkDoc (for your creations). Screenshots will show both side-by-side.",
+        "parameters": {
+            "target_stl_path": "string (path to reference STL file)",
+            "target_doc_name": "string (optional, default 'TargetDoc')",
+            "work_doc_name": "string (optional, default 'WorkDoc')"
+        }
+    },
     "new_document": {
         "description": "Create a new FreeCAD document",
         "parameters": {"name": "string (optional, default 'Unnamed')"}
@@ -123,8 +364,10 @@ TOOLS = {
         "parameters": {}
     },
     "list_objects": {
-        "description": "List all objects in the active document",
-        "parameters": {}
+        "description": "List all objects in a document",
+        "parameters": {
+            "doc": "string (optional: 'target', 'work', default 'work' in dual mode)"
+        }
     },
     "create_box": {
         "description": "Create a box primitive",
@@ -168,7 +411,10 @@ TOOLS = {
     },
     "get_object_info": {
         "description": "Get object information (volume, bounds, etc.)",
-        "parameters": {"name": "string"}
+        "parameters": {
+            "name": "string",
+            "doc": "string (optional: 'target', 'work', default 'work' in dual mode)"
+        }
     },
     "save_document": {
         "description": "Save the document",
@@ -195,22 +441,26 @@ TOOLS = {
     },
     # === View and Screenshot Tools ===
     "take_screenshot": {
-        "description": "Take a manual screenshot with custom settings (auto-screenshots use defaults)",
+        "description": "Take a screenshot. In dual mode, defaults to split view showing both target and work.",
         "parameters": {
+            "mode": "string (optional: 'split', 'target', 'work', default 'split' in dual mode)",
             "width": "number (optional, default 800)",
             "height": "number (optional, default 600)",
             "background": "string (optional: 'White', 'Black', 'Transparent', default 'White')"
         }
     },
     "set_view": {
-        "description": "Set camera to a preset view angle",
+        "description": "Set camera to a preset view angle for a specific document",
         "parameters": {
-            "preset": "string (front/back/top/bottom/left/right/isometric)"
+            "preset": "string (front/back/top/bottom/left/right/isometric)",
+            "doc": "string (optional: 'target', 'work', or 'both', default 'work' in dual mode)"
         }
     },
     "fit_all": {
         "description": "Fit camera to show all objects in the viewport",
-        "parameters": {}
+        "parameters": {
+            "doc": "string (optional: 'target', 'work', or 'both', default 'work' in dual mode)"
+        }
     },
     "import_stl": {
         "description": "Import an STL file as a visible mesh object (for reference/target)",
@@ -227,11 +477,12 @@ TOOLS = {
         }
     },
     "rotate_view": {
-        "description": "Rotate the camera view by specified angles",
+        "description": "Rotate the camera view by specified angles for a specific document",
         "parameters": {
             "yaw": "number (degrees, rotation around Z axis, optional)",
             "pitch": "number (degrees, rotation around X axis, optional)",
-            "roll": "number (degrees, rotation around Y axis, optional)"
+            "roll": "number (degrees, rotation around Y axis, optional)",
+            "doc": "string (optional: 'target', 'work', or 'both', default 'work' in dual mode)"
         }
     },
 }
@@ -241,9 +492,105 @@ def execute_tool(name: str, arguments: dict) -> dict:
     """Execute a tool on the main thread."""
     
     def _execute():
-        doc = FreeCAD.ActiveDocument
+        global _target_doc_name, _work_doc_name, _dual_mode_enabled
         
-        if name == "new_document":
+        # For most tools, use work doc in dual mode, else active document
+        if is_dual_mode():
+            doc = get_work_doc()
+        else:
+            doc = FreeCAD.ActiveDocument
+        
+        if name == "setup_dual_docs":
+            import Mesh
+            import os as os_module
+            
+            stl_path = arguments.get("target_stl_path")
+            if not stl_path:
+                return {"success": False, "error": "target_stl_path is required"}
+            
+            if not os_module.path.exists(stl_path):
+                return {"success": False, "error": f"File not found: {stl_path}"}
+            
+            target_name = arguments.get("target_doc_name", "TargetDoc")
+            work_name = arguments.get("work_doc_name", "WorkDoc")
+            
+            try:
+                # Close existing docs if they exist
+                for existing_name in [target_name, work_name]:
+                    try:
+                        existing = FreeCAD.getDocument(existing_name)
+                        if existing:
+                            FreeCAD.closeDocument(existing_name)
+                    except:
+                        pass
+                
+                # Create TargetDoc and import STL
+                target_doc = FreeCAD.newDocument(target_name)
+                _target_doc_name = target_doc.Name
+                
+                # Import STL into target doc
+                Mesh.insert(stl_path, target_doc.Name)
+                
+                # Find the imported mesh object
+                mesh_objects = [o for o in target_doc.Objects if o.TypeId == "Mesh::Feature"]
+                target_mesh_name = None
+                target_mesh_info = {}
+                if mesh_objects:
+                    imported = mesh_objects[-1]
+                    imported.Label = "TargetMesh"
+                    target_mesh_name = imported.Name
+                    target_mesh_info = {
+                        "name": imported.Name,
+                        "label": imported.Label,
+                        "points": imported.Mesh.CountPoints,
+                        "facets": imported.Mesh.CountFacets
+                    }
+                
+                target_doc.recompute()
+                
+                # Create WorkDoc (empty, for agent to build in)
+                work_doc = FreeCAD.newDocument(work_name)
+                _work_doc_name = work_doc.Name
+                
+                # Set work doc as active (all creation tools will use this)
+                FreeCAD.setActiveDocument(work_doc.Name)
+                
+                # Enable dual mode
+                _dual_mode_enabled = True
+                
+                # Set up views
+                try:
+                    import FreeCADGui
+                    from PySide2 import QtWidgets
+                    
+                    # Set isometric view for both
+                    for doc_name in [_target_doc_name, _work_doc_name]:
+                        activate_document(doc_name)
+                        gui_doc = FreeCADGui.getDocument(doc_name)
+                        if gui_doc and gui_doc.ActiveView:
+                            gui_doc.ActiveView.viewIsometric()
+                            gui_doc.ActiveView.fitAll()
+                    
+                    # Re-activate work doc
+                    activate_document(_work_doc_name)
+                    QtWidgets.QApplication.processEvents()
+                except Exception as e:
+                    FreeCAD.Console.PrintWarning(f"View setup warning: {e}\n")
+                
+                return {
+                    "success": True,
+                    "target_doc": _target_doc_name,
+                    "work_doc": _work_doc_name,
+                    "target_mesh": target_mesh_info,
+                    "dual_mode": True,
+                    "message": f"Dual mode enabled. Target STL loaded into '{_target_doc_name}'. Create objects in '{_work_doc_name}'."
+                }
+                
+            except Exception as e:
+                reset_dual_mode()
+                return {"success": False, "error": f"Failed to setup dual docs: {e}"}
+        
+        elif name == "new_document":
             doc_name = arguments.get("name", "Unnamed")
             doc = FreeCAD.newDocument(doc_name)
             return {"success": True, "document": doc.Name}
@@ -254,15 +601,28 @@ def execute_tool(name: str, arguments: dict) -> dict:
             return {"success": True, "documents": docs}
         
         elif name == "list_objects":
-            if doc is None:
+            # Allow querying specific document in dual mode
+            doc_param = arguments.get("doc", "work" if is_dual_mode() else None)
+            query_doc = doc
+            if is_dual_mode():
+                if doc_param == "target":
+                    query_doc = get_target_doc()
+                elif doc_param == "work":
+                    query_doc = get_work_doc()
+            
+            if query_doc is None:
                 return {"success": False, "error": "No active document"}
             objects = []
-            for obj in doc.Objects:
+            for obj in query_doc.Objects:
                 info = {"name": obj.Name, "type": obj.TypeId}
                 if hasattr(obj, "Shape") and hasattr(obj.Shape, "Volume"):
                     info["volume"] = round(obj.Shape.Volume, 2)
+                # For mesh objects, include mesh info
+                if obj.TypeId == "Mesh::Feature" and hasattr(obj, "Mesh"):
+                    info["points"] = obj.Mesh.CountPoints
+                    info["facets"] = obj.Mesh.CountFacets
                 objects.append(info)
-            return {"success": True, "objects": objects}
+            return {"success": True, "objects": objects, "document": query_doc.Name}
         
         elif name == "create_box":
             if doc is None:
@@ -390,17 +750,35 @@ def execute_tool(name: str, arguments: dict) -> dict:
             return {"success": True, "path": arguments["path"]}
         
         elif name == "get_object_info":
-            if doc is None:
+            # Allow querying specific document in dual mode
+            doc_param = arguments.get("doc", "work" if is_dual_mode() else None)
+            query_doc = doc
+            if is_dual_mode():
+                if doc_param == "target":
+                    query_doc = get_target_doc()
+                elif doc_param == "work":
+                    query_doc = get_work_doc()
+            
+            if query_doc is None:
                 return {"success": False, "error": "No active document"}
-            obj = doc.getObject(arguments["name"])
+            obj = query_doc.getObject(arguments["name"])
             if not obj:
-                return {"success": False, "error": "Object not found"}
-            info = {"name": obj.Name, "type": obj.TypeId}
+                return {"success": False, "error": f"Object '{arguments['name']}' not found in {query_doc.Name}"}
+            info = {"name": obj.Name, "type": obj.TypeId, "document": query_doc.Name}
             if hasattr(obj, "Shape"):
                 s = obj.Shape
                 info["volume"] = round(s.Volume, 2)
                 info["area"] = round(s.Area, 2)
                 b = s.BoundBox
+                info["bounds"] = {"min": [b.XMin, b.YMin, b.ZMin], "max": [b.XMax, b.YMax, b.ZMax]}
+            # For mesh objects, include mesh-specific info
+            if obj.TypeId == "Mesh::Feature" and hasattr(obj, "Mesh"):
+                mesh = obj.Mesh
+                info["points"] = mesh.CountPoints
+                info["facets"] = mesh.CountFacets
+                info["volume"] = round(mesh.Volume, 2)
+                info["area"] = round(mesh.Area, 2)
+                b = mesh.BoundBox
                 info["bounds"] = {"min": [b.XMin, b.YMin, b.ZMin], "max": [b.XMax, b.YMax, b.ZMax]}
             return {"success": True, "info": info}
         
@@ -576,10 +954,22 @@ def execute_tool(name: str, arguments: dict) -> dict:
             width = arguments.get("width", _screenshot_width)
             height = arguments.get("height", _screenshot_height)
             background = arguments.get("background", "White")
+            mode = arguments.get("mode", "split" if is_dual_mode() else "single")
             
-            screenshot = capture_viewport_base64(width, height, background)
+            if is_dual_mode():
+                if mode == "split":
+                    screenshot = capture_split_view(width // 2, height)
+                elif mode == "target":
+                    screenshot = capture_document_viewport(_target_doc_name, width, height)
+                elif mode == "work":
+                    screenshot = capture_document_viewport(_work_doc_name, width, height)
+                else:
+                    screenshot = capture_split_view(width // 2, height)
+            else:
+                screenshot = capture_viewport_base64(width, height, background)
+            
             if screenshot:
-                return {"success": True, "screenshot": screenshot, "width": width, "height": height}
+                return {"success": True, "screenshot": screenshot, "width": width, "height": height, "mode": mode}
             else:
                 return {"success": False, "error": "Failed to capture screenshot (GUI may not be available)"}
         
@@ -588,35 +978,60 @@ def execute_tool(name: str, arguments: dict) -> dict:
                 import FreeCADGui
                 from PySide2 import QtWidgets
                 
-                if FreeCADGui.ActiveDocument is None:
-                    return {"success": False, "error": "No active document with view"}
-                
-                view = FreeCADGui.ActiveDocument.ActiveView
                 preset = arguments.get("preset", "isometric").lower()
+                doc_param = arguments.get("doc", "work" if is_dual_mode() else None)
                 
-                # Use FreeCAD's built-in view methods
-                if preset == "front":
-                    view.viewFront()
-                elif preset == "back":
-                    view.viewRear()
-                elif preset == "top":
-                    view.viewTop()
-                elif preset == "bottom":
-                    view.viewBottom()
-                elif preset == "left":
-                    view.viewLeft()
-                elif preset == "right":
-                    view.viewRight()
-                elif preset == "isometric":
-                    view.viewIsometric()
+                def apply_view_preset(view, preset_name):
+                    """Apply a view preset to a view."""
+                    if preset_name == "front":
+                        view.viewFront()
+                    elif preset_name == "back":
+                        view.viewRear()
+                    elif preset_name == "top":
+                        view.viewTop()
+                    elif preset_name == "bottom":
+                        view.viewBottom()
+                    elif preset_name == "left":
+                        view.viewLeft()
+                    elif preset_name == "right":
+                        view.viewRight()
+                    elif preset_name == "isometric":
+                        view.viewIsometric()
+                    else:
+                        return False
+                    view.fitAll()
+                    return True
+                
+                # Determine which documents to apply the view to
+                docs_to_update = []
+                if is_dual_mode():
+                    if doc_param == "target":
+                        docs_to_update = [_target_doc_name]
+                    elif doc_param == "work":
+                        docs_to_update = [_work_doc_name]
+                    elif doc_param == "both":
+                        docs_to_update = [_target_doc_name, _work_doc_name]
+                    else:
+                        docs_to_update = [_work_doc_name]
                 else:
-                    return {"success": False, "error": f"Unknown view preset: {preset}. Use: front/back/top/bottom/left/right/isometric"}
+                    if FreeCADGui.ActiveDocument is None:
+                        return {"success": False, "error": "No active document with view"}
+                    docs_to_update = [FreeCAD.ActiveDocument.Name]
                 
-                # Fit all and update
-                view.fitAll()
+                updated_docs = []
+                for doc_name in docs_to_update:
+                    if activate_document(doc_name):
+                        gui_doc = FreeCADGui.getDocument(doc_name)
+                        if gui_doc and gui_doc.ActiveView:
+                            if apply_view_preset(gui_doc.ActiveView, preset):
+                                updated_docs.append(doc_name)
+                
                 QtWidgets.QApplication.processEvents()
                 
-                return {"success": True, "view": preset}
+                if not updated_docs:
+                    return {"success": False, "error": f"Unknown view preset: {preset}. Use: front/back/top/bottom/left/right/isometric"}
+                
+                return {"success": True, "view": preset, "documents": updated_docs}
             except Exception as e:
                 return {"success": False, "error": f"Failed to set view: {e}"}
         
@@ -625,14 +1040,35 @@ def execute_tool(name: str, arguments: dict) -> dict:
                 import FreeCADGui
                 from PySide2 import QtWidgets
                 
-                if FreeCADGui.ActiveDocument is None:
-                    return {"success": False, "error": "No active document with view"}
+                doc_param = arguments.get("doc", "work" if is_dual_mode() else None)
                 
-                view = FreeCADGui.ActiveDocument.ActiveView
-                view.fitAll()
+                # Determine which documents to apply fit_all to
+                docs_to_update = []
+                if is_dual_mode():
+                    if doc_param == "target":
+                        docs_to_update = [_target_doc_name]
+                    elif doc_param == "work":
+                        docs_to_update = [_work_doc_name]
+                    elif doc_param == "both":
+                        docs_to_update = [_target_doc_name, _work_doc_name]
+                    else:
+                        docs_to_update = [_work_doc_name]
+                else:
+                    if FreeCADGui.ActiveDocument is None:
+                        return {"success": False, "error": "No active document with view"}
+                    docs_to_update = [FreeCAD.ActiveDocument.Name]
+                
+                updated_docs = []
+                for doc_name in docs_to_update:
+                    if activate_document(doc_name):
+                        gui_doc = FreeCADGui.getDocument(doc_name)
+                        if gui_doc and gui_doc.ActiveView:
+                            gui_doc.ActiveView.fitAll()
+                            updated_docs.append(doc_name)
+                
                 QtWidgets.QApplication.processEvents()
                 
-                return {"success": True}
+                return {"success": True, "documents": updated_docs}
             except Exception as e:
                 return {"success": False, "error": f"Failed to fit view: {e}"}
         
@@ -718,33 +1154,54 @@ def execute_tool(name: str, arguments: dict) -> dict:
                 import FreeCADGui
                 from PySide2 import QtWidgets
                 
-                if FreeCADGui.ActiveDocument is None:
-                    return {"success": False, "error": "No active document with view"}
-                
-                view = FreeCADGui.ActiveDocument.ActiveView
-                
                 yaw = arguments.get("yaw", 0)
                 pitch = arguments.get("pitch", 0)
                 roll = arguments.get("roll", 0)
+                doc_param = arguments.get("doc", "work" if is_dual_mode() else None)
                 
-                # Get current orientation and apply rotations
-                current_rot = view.getCameraOrientation()
+                def apply_rotation(view, yaw_val, pitch_val, roll_val):
+                    """Apply rotation to a view."""
+                    current_rot = view.getCameraOrientation()
+                    
+                    if yaw_val != 0:
+                        rot_z = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), yaw_val)
+                        current_rot = rot_z.multiply(current_rot)
+                    if pitch_val != 0:
+                        rot_x = FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), pitch_val)
+                        current_rot = rot_x.multiply(current_rot)
+                    if roll_val != 0:
+                        rot_y = FreeCAD.Rotation(FreeCAD.Vector(0, 1, 0), roll_val)
+                        current_rot = rot_y.multiply(current_rot)
+                    
+                    view.setCameraOrientation(current_rot)
                 
-                # Apply rotations (yaw around Z, pitch around X, roll around Y)
-                if yaw != 0:
-                    rot_z = FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), yaw)
-                    current_rot = rot_z.multiply(current_rot)
-                if pitch != 0:
-                    rot_x = FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), pitch)
-                    current_rot = rot_x.multiply(current_rot)
-                if roll != 0:
-                    rot_y = FreeCAD.Rotation(FreeCAD.Vector(0, 1, 0), roll)
-                    current_rot = rot_y.multiply(current_rot)
+                # Determine which documents to apply rotation to
+                docs_to_update = []
+                if is_dual_mode():
+                    if doc_param == "target":
+                        docs_to_update = [_target_doc_name]
+                    elif doc_param == "work":
+                        docs_to_update = [_work_doc_name]
+                    elif doc_param == "both":
+                        docs_to_update = [_target_doc_name, _work_doc_name]
+                    else:
+                        docs_to_update = [_work_doc_name]
+                else:
+                    if FreeCADGui.ActiveDocument is None:
+                        return {"success": False, "error": "No active document with view"}
+                    docs_to_update = [FreeCAD.ActiveDocument.Name]
                 
-                view.setCameraOrientation(current_rot)
+                updated_docs = []
+                for doc_name in docs_to_update:
+                    if activate_document(doc_name):
+                        gui_doc = FreeCADGui.getDocument(doc_name)
+                        if gui_doc and gui_doc.ActiveView:
+                            apply_rotation(gui_doc.ActiveView, yaw, pitch, roll)
+                            updated_docs.append(doc_name)
+                
                 QtWidgets.QApplication.processEvents()
                 
-                return {"success": True, "yaw": yaw, "pitch": pitch, "roll": roll}
+                return {"success": True, "yaw": yaw, "pitch": pitch, "roll": roll, "documents": updated_docs}
             except Exception as e:
                 return {"success": False, "error": f"Failed to rotate view: {e}"}
         
@@ -762,7 +1219,17 @@ def execute_tool(name: str, arguments: dict) -> dict:
         # Skip screenshot for list_tools and get_mesh_points (large data responses)
         skip_screenshot_tools = {"list_tools", "get_mesh_points", "take_screenshot"}
         if name not in skip_screenshot_tools:
-            screenshot = capture_viewport_base64()
+            # Run capture on the main thread to avoid GUI thread crashes
+            def _capture_screenshot():
+                if is_dual_mode():
+                    return capture_split_view()
+                return capture_viewport_base64()
+            
+            try:
+                screenshot = _bridge.execute_sync(_capture_screenshot)
+            except Exception as e:
+                FreeCAD.Console.PrintWarning(f"Auto screenshot failed: {e}\n")
+                screenshot = None
             if screenshot:
                 result["screenshot"] = screenshot
     
