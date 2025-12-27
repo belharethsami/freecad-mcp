@@ -37,6 +37,33 @@ _target_doc_name: Optional[str] = None
 _work_doc_name: Optional[str] = None
 _dual_mode_enabled: bool = False
 
+# Measurement mode state
+_measurement_mode: bool = False
+_grid_config = {
+    "enabled": False,
+    "columns": 8,
+    "rows": 6,
+    # Zoom region (normalized 0-1 screen coordinates)
+    "region": {"x_min": 0.0, "x_max": 1.0, "y_min": 0.0, "y_max": 1.0}
+}
+
+# Point selection state
+_pending_points = {}    # Points selected but not yet confirmed
+_confirmed_points = {}  # Points locked in after confirmation
+_point_counter = 0      # For generating point_1, point_2, etc.
+
+# Measurement visualization
+_measurement_objects = []  # Track measurement lines for cleanup
+
+# High-contrast marker colors (cycle through these)
+_marker_colors = [
+    (1.0, 0.0, 1.0),   # Magenta
+    (0.0, 1.0, 1.0),   # Cyan
+    (1.0, 1.0, 0.0),   # Yellow
+    (0.0, 1.0, 0.0),   # Green
+    (1.0, 0.5, 0.0),   # Orange
+]
+
 
 def is_dual_mode() -> bool:
     """Check if dual document mode is active."""
@@ -345,6 +372,377 @@ def set_auto_screenshot(enabled: bool, width: int = 800, height: int = 600):
     _screenshot_width = width
     _screenshot_height = height
 
+
+def parse_grid_cell(cell: str) -> Tuple[int, int]:
+    """
+    Parse a grid cell string like 'C2' into column and row indices.
+    
+    Args:
+        cell: Grid cell string (e.g., 'A1', 'C2', 'H6')
+    
+    Returns:
+        Tuple of (column_index, row_index), both 0-based
+    """
+    cell = cell.upper().strip()
+    if len(cell) < 2:
+        raise ValueError(f"Invalid grid cell: {cell}")
+    
+    col_char = cell[0]
+    row_str = cell[1:]
+    
+    if not col_char.isalpha():
+        raise ValueError(f"Invalid column letter: {col_char}")
+    
+    col = ord(col_char) - ord('A')
+    try:
+        row = int(row_str) - 1  # Convert to 0-based
+    except ValueError:
+        raise ValueError(f"Invalid row number: {row_str}")
+    
+    return col, row
+
+
+def render_grid_overlay(image_data: bytes, columns: int = 8, rows: int = 6) -> bytes:
+    """
+    Render a grid overlay onto an image.
+    
+    Args:
+        image_data: PNG image data as bytes
+        columns: Number of columns (default 8 for A-H)
+        rows: Number of rows (default 6 for 1-6)
+    
+    Returns:
+        PNG image data with grid overlay as bytes
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import io
+        
+        # Load image
+        img = Image.open(io.BytesIO(image_data))
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
+        
+        # Create overlay
+        overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        
+        w, h = img.size
+        cell_w = w / columns
+        cell_h = h / rows
+        
+        # Grid line color (semi-transparent white)
+        line_color = (255, 255, 255, 180)
+        text_color = (255, 255, 255, 220)
+        bg_color = (0, 0, 0, 100)  # Semi-transparent background for labels
+        
+        # Try to use a readable font size
+        font_size = max(12, min(20, int(cell_h / 4)))
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+        except:
+            try:
+                font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+            except:
+                font = ImageFont.load_default()
+        
+        # Draw vertical lines and column labels (A-H)
+        for i in range(columns + 1):
+            x = int(i * cell_w)
+            draw.line([(x, 0), (x, h)], fill=line_color, width=1)
+            
+            if i < columns:
+                label = chr(ord('A') + i)
+                # Get text size
+                try:
+                    bbox = draw.textbbox((0, 0), label, font=font)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+                except:
+                    text_w, text_h = 10, 12
+                
+                label_x = int(i * cell_w + cell_w / 2 - text_w / 2)
+                label_y = 5
+                
+                # Draw background for label
+                draw.rectangle([label_x - 2, label_y - 1, label_x + text_w + 2, label_y + text_h + 1], 
+                              fill=bg_color)
+                draw.text((label_x, label_y), label, fill=text_color, font=font)
+        
+        # Draw horizontal lines and row labels (1-6)
+        for j in range(rows + 1):
+            y = int(j * cell_h)
+            draw.line([(0, y), (w, y)], fill=line_color, width=1)
+            
+            if j < rows:
+                label = str(j + 1)
+                try:
+                    bbox = draw.textbbox((0, 0), label, font=font)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+                except:
+                    text_w, text_h = 10, 12
+                
+                label_x = 5
+                label_y = int(j * cell_h + cell_h / 2 - text_h / 2)
+                
+                # Draw background for label
+                draw.rectangle([label_x - 2, label_y - 1, label_x + text_w + 2, label_y + text_h + 1],
+                              fill=bg_color)
+                draw.text((label_x, label_y), label, fill=text_color, font=font)
+        
+        # Composite overlay onto image
+        img = Image.alpha_composite(img, overlay)
+        
+        # Convert back to bytes
+        buffer = io.BytesIO()
+        img.save(buffer, format='PNG')
+        buffer.seek(0)
+        return buffer.read()
+        
+    except ImportError:
+        FreeCAD.Console.PrintWarning("PIL not available for grid overlay\n")
+        return image_data
+    except Exception as e:
+        FreeCAD.Console.PrintWarning(f"Grid overlay failed: {e}\n")
+        return image_data
+
+
+def add_point_labels_overlay(image_data: bytes, points: dict, view) -> bytes:
+    """
+    Add coordinate labels for point markers onto an image.
+    
+    Args:
+        image_data: PNG image data as bytes
+        points: Dictionary of point_id -> point info
+        view: FreeCAD view for 3D to 2D coordinate conversion
+    
+    Returns:
+        PNG image data with labels as bytes
+    """
+    if not points:
+        return image_data
+    
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import io
+        
+        img = Image.open(io.BytesIO(image_data))
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
+        
+        draw = ImageDraw.Draw(img)
+        
+        # Font setup
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 12)
+        except:
+            try:
+                font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 12)
+            except:
+                font = ImageFont.load_default()
+        
+        for point_id, info in points.items():
+            coords = info.get("coords")
+            if coords is None:
+                continue
+            
+            # Try to get 2D screen position
+            try:
+                screen_pos = view.getPointOnViewport(coords)
+                if screen_pos:
+                    x, y = int(screen_pos[0]), int(screen_pos[1])
+                else:
+                    continue
+            except:
+                # Fallback: just place label at a fixed offset
+                continue
+            
+            # Create label text
+            status = "✓" if info.get("confirmed", False) else "?"
+            label = f"{point_id}{status}: ({coords.x:.1f}, {coords.y:.1f}, {coords.z:.1f})"
+            
+            # Draw background
+            try:
+                bbox = draw.textbbox((0, 0), label, font=font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+            except:
+                text_w, text_h = len(label) * 7, 14
+            
+            label_x = x + 10
+            label_y = y - 5
+            
+            # Keep label on screen
+            label_x = min(label_x, img.width - text_w - 5)
+            label_y = max(label_y, 5)
+            
+            bg_color = (0, 0, 0, 180)
+            text_color = (255, 255, 0, 255) if info.get("confirmed") else (255, 200, 100, 255)
+            
+            draw.rectangle([label_x - 2, label_y - 1, label_x + text_w + 2, label_y + text_h + 1],
+                          fill=bg_color)
+            draw.text((label_x, label_y), label, fill=text_color, font=font)
+        
+        # Convert back to bytes
+        buffer = io.BytesIO()
+        img.save(buffer, format='PNG')
+        buffer.seek(0)
+        return buffer.read()
+        
+    except ImportError:
+        return image_data
+    except Exception as e:
+        FreeCAD.Console.PrintWarning(f"Point label overlay failed: {e}\n")
+        return image_data
+
+
+def capture_with_grid_and_labels(width: int = None, height: int = None) -> Optional[str]:
+    """
+    Capture viewport with grid overlay and point labels if measurement mode is active.
+    
+    Returns:
+        Base64-encoded PNG string with overlays
+    """
+    global _grid_config, _pending_points, _confirmed_points
+    
+    if width is None:
+        width = _screenshot_width
+    if height is None:
+        height = _screenshot_height
+    
+    try:
+        import FreeCADGui
+        from PySide2 import QtWidgets
+        
+        # Force GUI update
+        QtWidgets.QApplication.processEvents()
+        
+        if FreeCADGui.ActiveDocument is None:
+            return None
+        
+        view = FreeCADGui.ActiveDocument.ActiveView
+        if view is None:
+            return None
+        
+        # Capture base screenshot
+        fd, path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        
+        try:
+            view.saveImage(path, width, height, "Current")
+            
+            if not os.path.exists(path) or os.path.getsize(path) < 100:
+                return None
+            
+            with open(path, "rb") as f:
+                image_data = f.read()
+            
+            # Add grid overlay if measurement mode is active
+            if _measurement_mode and _grid_config.get("enabled", False):
+                image_data = render_grid_overlay(
+                    image_data,
+                    _grid_config.get("columns", 8),
+                    _grid_config.get("rows", 6)
+                )
+            
+            # Add point labels
+            all_points = {}
+            for pid, pinfo in _pending_points.items():
+                all_points[pid] = {**pinfo, "confirmed": False}
+            for pid, pinfo in _confirmed_points.items():
+                all_points[pid] = {**pinfo, "confirmed": True}
+            
+            if all_points:
+                image_data = add_point_labels_overlay(image_data, all_points, view)
+            
+            return base64.b64encode(image_data).decode('utf-8')
+            
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+                
+    except Exception as e:
+        FreeCAD.Console.PrintWarning(f"Capture with grid failed: {e}\n")
+        return None
+
+
+def estimate_marker_size() -> float:
+    """
+    Estimate an appropriate marker sphere size based on the model's bounding box.
+    
+    Returns:
+        Recommended marker radius in mm
+    """
+    try:
+        doc = FreeCAD.ActiveDocument
+        if not doc:
+            return 2.0
+        
+        # Find bounding box of all objects
+        min_coords = [float('inf')] * 3
+        max_coords = [float('-inf')] * 3
+        
+        for obj in doc.Objects:
+            if hasattr(obj, "Shape") and hasattr(obj.Shape, "BoundBox"):
+                bb = obj.Shape.BoundBox
+                min_coords = [min(min_coords[i], [bb.XMin, bb.YMin, bb.ZMin][i]) for i in range(3)]
+                max_coords = [max(max_coords[i], [bb.XMax, bb.YMax, bb.ZMax][i]) for i in range(3)]
+            elif obj.TypeId == "Mesh::Feature" and hasattr(obj, "Mesh"):
+                bb = obj.Mesh.BoundBox
+                min_coords = [min(min_coords[i], [bb.XMin, bb.YMin, bb.ZMin][i]) for i in range(3)]
+                max_coords = [max(max_coords[i], [bb.XMax, bb.YMax, bb.ZMax][i]) for i in range(3)]
+        
+        if float('inf') in min_coords:
+            return 2.0
+        
+        # Calculate diagonal
+        diagonal = sum((max_coords[i] - min_coords[i]) ** 2 for i in range(3)) ** 0.5
+        
+        # Marker should be about 1-2% of diagonal, but at least 0.5mm and at most 5mm
+        marker_size = max(0.5, min(5.0, diagonal * 0.015))
+        return marker_size
+        
+    except Exception:
+        return 2.0
+
+
+def get_scene_bounding_box():
+    """Get the bounding box encompassing all objects in the active document."""
+    try:
+        doc = FreeCAD.ActiveDocument
+        if not doc:
+            return None
+        
+        min_coords = [float('inf')] * 3
+        max_coords = [float('-inf')] * 3
+        found_objects = False
+        
+        for obj in doc.Objects:
+            bb = None
+            if hasattr(obj, "Shape") and hasattr(obj.Shape, "BoundBox"):
+                bb = obj.Shape.BoundBox
+            elif obj.TypeId == "Mesh::Feature" and hasattr(obj, "Mesh"):
+                bb = obj.Mesh.BoundBox
+            
+            if bb:
+                found_objects = True
+                min_coords = [min(min_coords[i], [bb.XMin, bb.YMin, bb.ZMin][i]) for i in range(3)]
+                max_coords = [max(max_coords[i], [bb.XMax, bb.YMax, bb.ZMax][i]) for i in range(3)]
+        
+        if not found_objects:
+            return None
+        
+        return {
+            "min": min_coords,
+            "max": max_coords,
+            "center": [(min_coords[i] + max_coords[i]) / 2 for i in range(3)],
+            "size": [max_coords[i] - min_coords[i] for i in range(3)]
+        }
+        
+    except Exception:
+        return None
+
 # Tool definitions
 TOOLS = {
     "setup_dual_docs": {
@@ -485,6 +883,94 @@ TOOLS = {
             "doc": "string (optional: 'target', 'work', or 'both', default 'work' in dual mode)"
         }
     },
+    # === Display Mode Tools ===
+    "set_display_mode": {
+        "description": "Change how an object renders (solid, transparent, or wireframe)",
+        "parameters": {
+            "object": "string (object name)",
+            "mode": "string ('solid', 'transparent', or 'wireframe')",
+            "transparency": "number (optional, 0-100 for transparent mode, default 70)"
+        }
+    },
+    "set_clipping_plane": {
+        "description": "Enable a cross-section clipping plane to reveal internal surfaces",
+        "parameters": {
+            "axis": "string ('X', 'Y', or 'Z')",
+            "percent": "number (0-100, position along axis as percentage of bounding box)",
+            "enabled": "boolean (true to enable, false to disable)"
+        }
+    },
+    # === Camera Navigation Tools ===
+    "zoom": {
+        "description": "Zoom camera in or out by a percentage",
+        "parameters": {
+            "percent": "number (>100 zooms in, <100 zooms out, e.g. 150 = 1.5x zoom)",
+            "doc": "string (optional: 'target', 'work', or 'both', default 'work' in dual mode)"
+        }
+    },
+    "pan": {
+        "description": "Pan camera by percentage of viewport",
+        "parameters": {
+            "x": "number (-100 to 100, percentage to pan horizontally)",
+            "y": "number (-100 to 100, percentage to pan vertically)",
+            "doc": "string (optional: 'target', 'work', or 'both', default 'work' in dual mode)"
+        }
+    },
+    # === Measurement Mode Tools ===
+    "start_measurement": {
+        "description": "Begin measurement mode: shows grid overlay (8x6) for point selection",
+        "parameters": {}
+    },
+    "end_measurement": {
+        "description": "End measurement mode: hides grid overlay, clears pending (unconfirmed) points",
+        "parameters": {}
+    },
+    "zoom_grid_region": {
+        "description": "Zoom into a grid region for precise point selection. The region becomes a new 8x6 grid.",
+        "parameters": {
+            "start_cell": "string (e.g. 'A5', 'C3' - top-left cell of the region)",
+            "size": "number (size of region: 2 = 2x2 cells, 3 = 3x3 cells)"
+        }
+    },
+    "reset_grid_zoom": {
+        "description": "Reset grid zoom to show the full view",
+        "parameters": {}
+    },
+    "select_point": {
+        "description": "Select a point on a mesh surface using grid coordinates. Places a visible marker.",
+        "parameters": {
+            "grid_cell": "string (e.g. 'C2', 'D5' - the grid cell to select)",
+            "offset_x": "number (optional, 0-1, position within cell horizontally, default 0.5)",
+            "offset_y": "number (optional, 0-1, position within cell vertically, default 0.5)"
+        }
+    },
+    "confirm_point": {
+        "description": "Confirm a pending point selection, locking it in for measurement",
+        "parameters": {
+            "point_id": "string (e.g. 'point_1')"
+        }
+    },
+    "clear_point": {
+        "description": "Remove a point marker (pending or confirmed)",
+        "parameters": {
+            "point_id": "string (point ID or 'all' to clear all points)"
+        }
+    },
+    "list_points": {
+        "description": "List all current point markers with their coordinates and status",
+        "parameters": {}
+    },
+    "measure_distance": {
+        "description": "Measure distance between two confirmed points. Draws a visual line between them.",
+        "parameters": {
+            "point_a": "string (first point ID, e.g. 'point_1')",
+            "point_b": "string (second point ID, e.g. 'point_2')"
+        }
+    },
+    "clear_measurements": {
+        "description": "Remove all measurement lines and markers",
+        "parameters": {}
+    },
 }
 
 
@@ -493,6 +979,9 @@ def execute_tool(name: str, arguments: dict) -> dict:
     
     def _execute():
         global _target_doc_name, _work_doc_name, _dual_mode_enabled
+        global _measurement_mode, _grid_config
+        global _pending_points, _confirmed_points, _point_counter
+        global _measurement_objects
         
         # For most tools, use work doc in dual mode, else active document
         if is_dual_mode():
@@ -1204,6 +1693,826 @@ def execute_tool(name: str, arguments: dict) -> dict:
                 return {"success": True, "yaw": yaw, "pitch": pitch, "roll": roll, "documents": updated_docs}
             except Exception as e:
                 return {"success": False, "error": f"Failed to rotate view: {e}"}
+        
+        # === Display Mode Tools ===
+        elif name == "set_display_mode":
+            try:
+                import FreeCADGui
+                
+                if doc is None:
+                    return {"success": False, "error": "No active document"}
+                
+                obj_name = arguments.get("object")
+                mode = arguments.get("mode", "solid").lower()
+                transparency = arguments.get("transparency", 70)
+                
+                obj = doc.getObject(obj_name)
+                if not obj:
+                    return {"success": False, "error": f"Object not found: {obj_name}"}
+                
+                if not hasattr(obj, "ViewObject") or obj.ViewObject is None:
+                    return {"success": False, "error": f"Object has no ViewObject: {obj_name}"}
+                
+                vo = obj.ViewObject
+                
+                if mode == "transparent":
+                    vo.Transparency = int(transparency)
+                    vo.DisplayMode = "Shaded"
+                elif mode == "wireframe":
+                    vo.Transparency = 0
+                    vo.DisplayMode = "Wireframe"
+                elif mode == "solid":
+                    vo.Transparency = 0
+                    vo.DisplayMode = "Shaded"
+                else:
+                    return {"success": False, "error": f"Unknown mode: {mode}. Use: solid, transparent, wireframe"}
+                
+                return {"success": True, "object": obj_name, "mode": mode, "transparency": vo.Transparency}
+            except Exception as e:
+                return {"success": False, "error": f"Failed to set display mode: {e}"}
+        
+        elif name == "set_clipping_plane":
+            try:
+                import FreeCADGui
+                from PySide2 import QtWidgets
+                
+                axis = arguments.get("axis", "X").upper()
+                try:
+                    percent = float(arguments.get("percent", 50.0))
+                except (TypeError, ValueError):
+                    return {"success": False, "error": "percent must be a number between 0 and 100"}
+                enabled = arguments.get("enabled", True)
+                
+                if axis not in ["X", "Y", "Z"]:
+                    return {"success": False, "error": f"Invalid axis: {axis}. Use X, Y, or Z"}
+                if percent < 0 or percent > 100:
+                    return {"success": False, "error": "Percent must be between 0 and 100"}
+                
+                if FreeCADGui.ActiveDocument is None:
+                    return {"success": False, "error": "No active document with view"}
+                
+                view = FreeCADGui.ActiveDocument.ActiveView
+                if view is None:
+                    return {"success": False, "error": "No active view"}
+                
+                # Prefer the ActiveView API; fall back to underlying viewer
+                viewer = None
+                try:
+                    viewer = view.getViewer()
+                except Exception:
+                    viewer = None
+                
+                toggle_handler = None
+                if hasattr(view, "toggleClippingPlane"):
+                    def _toggle_clip(toggle_val: int, placement: FreeCAD.Placement):
+                        try:
+                            view.toggleClippingPlane(toggle_val, False, True, placement)
+                        except TypeError:
+                            view.toggleClippingPlane(toggle_val)
+                    toggle_handler = _toggle_clip
+                elif viewer is not None and hasattr(viewer, "toggleClippingPlane"):
+                    def _toggle_clip(toggle_val: int, placement: FreeCAD.Placement):
+                        try:
+                            viewer.toggleClippingPlane(toggle_val, False, True, placement)
+                        except TypeError:
+                            viewer.toggleClippingPlane(toggle_val)
+                    toggle_handler = _toggle_clip
+                
+                if toggle_handler is None:
+                    return {"success": False, "error": "Viewer does not support clipping planes"}
+                
+                # Always remove any existing clip plane so we can reapply with new settings
+                try:
+                    toggle_handler(0, FreeCAD.Placement())
+                except Exception as e:
+                    return {"success": False, "error": f"Failed to reset clipping plane: {e}"}
+                # Also remove any fallback Coin3D clip plane we may have added
+                try:
+                    from pivy import coin
+                    if viewer is not None and hasattr(viewer, "getSoRenderManager"):
+                        sg = viewer.getSoRenderManager().getSceneGraph()
+                        clip_name = "MCP_ClipPlane"
+                        for i in range(sg.getNumChildren()):
+                            child = sg.getChild(i)
+                            if hasattr(child, "getName") and child.getName() == clip_name:
+                                sg.removeChild(i)
+                                break
+                except ImportError:
+                    pass
+                except Exception:
+                    pass
+                
+                if not enabled:
+                    QtWidgets.QApplication.processEvents()
+                    return {"success": True, "clipping": False}
+                
+                # Get bounding box to calculate position
+                bbox = get_scene_bounding_box()
+                if not bbox:
+                    return {"success": False, "error": "No objects in scene to clip"}
+                
+                axis_idx = {"X": 0, "Y": 1, "Z": 2}[axis]
+                min_val = bbox["min"][axis_idx]
+                max_val = bbox["max"][axis_idx]
+                position = min_val + (max_val - min_val) * (percent / 100.0)
+                
+                normal = FreeCAD.Vector(0, 0, 0)
+                point = FreeCAD.Vector(0, 0, 0)
+                if axis == "X":
+                    normal = FreeCAD.Vector(1, 0, 0)
+                    point = FreeCAD.Vector(position, 0, 0)
+                elif axis == "Y":
+                    normal = FreeCAD.Vector(0, 1, 0)
+                    point = FreeCAD.Vector(0, position, 0)
+                else:  # Z
+                    normal = FreeCAD.Vector(0, 0, 1)
+                    point = FreeCAD.Vector(0, 0, position)
+                
+                # Align FreeCAD's clip plane with the requested axis and location
+                rotation = FreeCAD.Rotation(FreeCAD.Vector(0, 0, -1), normal)
+                placement = FreeCAD.Placement(point, rotation)
+                
+                # Apply via viewer API, then fall back to Coin3D insertion if needed
+                clip_applied = False
+                try:
+                    toggle_handler(1, placement)
+                    # Verify if the viewer reports a clipping plane
+                    for candidate in (view, viewer):
+                        if candidate and hasattr(candidate, "hasClippingPlane"):
+                            try:
+                                if candidate.hasClippingPlane():
+                                    clip_applied = True
+                                    break
+                            except Exception:
+                                pass
+                except Exception as e:
+                    return {"success": False, "error": f"Failed to apply clipping plane: {e}"}
+                
+                if not clip_applied:
+                    try:
+                        from pivy import coin
+                        # Remove any existing fallback clip
+                        if viewer is not None and hasattr(viewer, "getSoRenderManager"):
+                            sg = viewer.getSoRenderManager().getSceneGraph()
+                            clip_name = "MCP_ClipPlane"
+                            for i in range(sg.getNumChildren()):
+                                child = sg.getChild(i)
+                                if hasattr(child, "getName") and child.getName() == clip_name:
+                                    sg.removeChild(i)
+                                    break
+                            
+                            clip = coin.SoClipPlane()
+                            clip.setName(clip_name)
+                            plane = coin.SbPlane(
+                                coin.SbVec3f(normal.x, normal.y, normal.z),
+                                coin.SbVec3f(point.x, point.y, point.z)
+                            )
+                            clip.plane.setValue(plane)
+                            clip.on.setValue(True)
+                            sg.insertChild(clip, 0)
+                            clip_applied = True
+                    except ImportError:
+                        pass
+                    except Exception as e:
+                        FreeCAD.Console.PrintWarning(f"Fallback clip plane failed: {e}\n")
+                
+                QtWidgets.QApplication.processEvents()
+                
+                return {
+                    "success": True,
+                    "clipping": True,
+                    "axis": axis,
+                    "percent": percent,
+                    "position_mm": round(position, 2)
+                }
+            except Exception as e:
+                return {"success": False, "error": f"Failed to set clipping plane: {e}"}
+        
+        # === Camera Navigation Tools ===
+        elif name == "zoom":
+            try:
+                import FreeCADGui
+                from PySide2 import QtWidgets
+                
+                percent = arguments.get("percent", 100)
+                doc_param = arguments.get("doc", "work" if is_dual_mode() else None)
+                
+                if percent <= 0:
+                    return {"success": False, "error": "Zoom percent must be positive"}
+                
+                def apply_zoom(view, zoom_percent):
+                    """Apply zoom to a view."""
+                    cam = view.getCameraNode()
+                    if cam is None:
+                        return False
+                    
+                    # For orthographic camera, adjust height
+                    # For perspective camera, adjust position
+                    try:
+                        current_height = cam.height.getValue()
+                        # Smaller height = more zoomed in
+                        new_height = current_height * (100.0 / zoom_percent)
+                        cam.height.setValue(new_height)
+                        return True
+                    except:
+                        # Try perspective zoom by moving camera
+                        try:
+                            pos = list(cam.position.getValue())
+                            factor = 100.0 / zoom_percent
+                            cam.position.setValue(pos[0] * factor, pos[1] * factor, pos[2] * factor)
+                            return True
+                        except:
+                            return False
+                
+                # Determine which documents to apply zoom to
+                docs_to_update = []
+                if is_dual_mode():
+                    if doc_param == "target":
+                        docs_to_update = [_target_doc_name]
+                    elif doc_param == "work":
+                        docs_to_update = [_work_doc_name]
+                    elif doc_param == "both":
+                        docs_to_update = [_target_doc_name, _work_doc_name]
+                    else:
+                        docs_to_update = [_work_doc_name]
+                else:
+                    if FreeCADGui.ActiveDocument is None:
+                        return {"success": False, "error": "No active document with view"}
+                    docs_to_update = [FreeCAD.ActiveDocument.Name]
+                
+                updated_docs = []
+                for doc_name in docs_to_update:
+                    if activate_document(doc_name):
+                        gui_doc = FreeCADGui.getDocument(doc_name)
+                        if gui_doc and gui_doc.ActiveView:
+                            if apply_zoom(gui_doc.ActiveView, percent):
+                                updated_docs.append(doc_name)
+                
+                QtWidgets.QApplication.processEvents()
+                
+                return {"success": True, "zoom_percent": percent, "documents": updated_docs}
+            except Exception as e:
+                return {"success": False, "error": f"Failed to zoom: {e}"}
+        
+        elif name == "pan":
+            try:
+                import FreeCADGui
+                from PySide2 import QtWidgets
+                
+                x_percent = arguments.get("x", 0)
+                y_percent = arguments.get("y", 0)
+                doc_param = arguments.get("doc", "work" if is_dual_mode() else None)
+                
+                def apply_pan(view, pan_x, pan_y):
+                    """Apply pan to a view."""
+                    cam = view.getCameraNode()
+                    if cam is None:
+                        return False
+                    
+                    try:
+                        # Get current camera height (viewport size indicator)
+                        height = cam.height.getValue()
+                        
+                        # Calculate pan in world units
+                        # Approximate aspect ratio
+                        try:
+                            view_size = view.getSize()
+                            aspect = view_size[0] / view_size[1] if view_size[1] > 0 else 1.5
+                        except:
+                            aspect = 1.5
+                        
+                        pan_world_x = height * aspect * (pan_x / 100.0)
+                        pan_world_y = height * (pan_y / 100.0)
+                        
+                        # Get camera orientation to pan in view-relative direction
+                        orientation = view.getCameraOrientation()
+                        right = orientation.multVec(FreeCAD.Vector(1, 0, 0))
+                        up = orientation.multVec(FreeCAD.Vector(0, 1, 0))
+                        
+                        # Calculate offset
+                        offset = right * pan_world_x + up * pan_world_y
+                        
+                        # Apply to camera position
+                        pos = cam.position.getValue()
+                        cam.position.setValue(pos[0] + offset.x, pos[1] + offset.y, pos[2] + offset.z)
+                        
+                        return True
+                    except Exception as e:
+                        FreeCAD.Console.PrintWarning(f"Pan failed: {e}\n")
+                        return False
+                
+                # Determine which documents to apply pan to
+                docs_to_update = []
+                if is_dual_mode():
+                    if doc_param == "target":
+                        docs_to_update = [_target_doc_name]
+                    elif doc_param == "work":
+                        docs_to_update = [_work_doc_name]
+                    elif doc_param == "both":
+                        docs_to_update = [_target_doc_name, _work_doc_name]
+                    else:
+                        docs_to_update = [_work_doc_name]
+                else:
+                    if FreeCADGui.ActiveDocument is None:
+                        return {"success": False, "error": "No active document with view"}
+                    docs_to_update = [FreeCAD.ActiveDocument.Name]
+                
+                updated_docs = []
+                for doc_name in docs_to_update:
+                    if activate_document(doc_name):
+                        gui_doc = FreeCADGui.getDocument(doc_name)
+                        if gui_doc and gui_doc.ActiveView:
+                            if apply_pan(gui_doc.ActiveView, x_percent, y_percent):
+                                updated_docs.append(doc_name)
+                
+                QtWidgets.QApplication.processEvents()
+                
+                return {"success": True, "pan_x": x_percent, "pan_y": y_percent, "documents": updated_docs}
+            except Exception as e:
+                return {"success": False, "error": f"Failed to pan: {e}"}
+        
+        # === Measurement Mode Tools ===
+        elif name == "start_measurement":
+            _measurement_mode = True
+            _grid_config["enabled"] = True
+            _grid_config["region"] = {"x_min": 0.0, "x_max": 1.0, "y_min": 0.0, "y_max": 1.0}
+            
+            # Capture screenshot with grid
+            screenshot = capture_with_grid_and_labels()
+            
+            result = {
+                "success": True,
+                "measurement_mode": True,
+                "grid": {
+                    "columns": _grid_config["columns"],
+                    "rows": _grid_config["rows"]
+                },
+                "message": "Measurement mode active. Use grid coordinates (A1-H6) to select points."
+            }
+            if screenshot:
+                result["screenshot"] = screenshot
+            
+            return result
+        
+        elif name == "end_measurement":
+            _measurement_mode = False
+            _grid_config["enabled"] = False
+            
+            # Clear pending points (keep confirmed ones)
+            cleared_pending = list(_pending_points.keys())
+            for point_id in cleared_pending:
+                info = _pending_points.pop(point_id, None)
+                if info and info.get("marker"):
+                    try:
+                        doc.removeObject(info["marker"].Name)
+                    except:
+                        pass
+            
+            return {
+                "success": True,
+                "measurement_mode": False,
+                "cleared_pending": cleared_pending,
+                "confirmed_points": list(_confirmed_points.keys())
+            }
+        
+        elif name == "zoom_grid_region":
+            if not _measurement_mode:
+                return {"success": False, "error": "Not in measurement mode. Call start_measurement first."}
+            
+            try:
+                start_cell = arguments.get("start_cell", "A1")
+                size = arguments.get("size", 2)
+                
+                col, row = parse_grid_cell(start_cell)
+                
+                # Validate
+                cols = _grid_config["columns"]
+                rows = _grid_config["rows"]
+                
+                if col < 0 or col >= cols or row < 0 or row >= rows:
+                    return {"success": False, "error": f"Invalid cell: {start_cell}"}
+                
+                if size < 1 or size > min(cols, rows):
+                    return {"success": False, "error": f"Invalid size: {size}. Must be 1-{min(cols, rows)}"}
+                
+                # Calculate new region bounds (as fraction of current region)
+                current = _grid_config["region"]
+                cell_width = (current["x_max"] - current["x_min"]) / cols
+                cell_height = (current["y_max"] - current["y_min"]) / rows
+                
+                new_x_min = current["x_min"] + col * cell_width
+                new_x_max = min(current["x_max"], new_x_min + size * cell_width)
+                new_y_min = current["y_min"] + row * cell_height
+                new_y_max = min(current["y_max"], new_y_min + size * cell_height)
+                
+                _grid_config["region"] = {
+                    "x_min": new_x_min,
+                    "x_max": new_x_max,
+                    "y_min": new_y_min,
+                    "y_max": new_y_max
+                }
+                
+                # Also zoom the camera to this region
+                # This is approximate - zoom in by the inverse of the region size
+                zoom_factor = 1.0 / (size / cols)
+                
+                try:
+                    import FreeCADGui
+                    from PySide2 import QtWidgets
+                    
+                    if FreeCADGui.ActiveDocument and FreeCADGui.ActiveDocument.ActiveView:
+                        view = FreeCADGui.ActiveDocument.ActiveView
+                        cam = view.getCameraNode()
+                        if cam:
+                            current_height = cam.height.getValue()
+                            cam.height.setValue(current_height / zoom_factor)
+                        QtWidgets.QApplication.processEvents()
+                except:
+                    pass
+                
+                # Capture with new grid
+                screenshot = capture_with_grid_and_labels()
+                
+                result = {
+                    "success": True,
+                    "zoomed_to": f"{start_cell} (size {size})",
+                    "region": _grid_config["region"],
+                    "message": f"Zoomed to region starting at {start_cell}. Grid now covers this zoomed area."
+                }
+                if screenshot:
+                    result["screenshot"] = screenshot
+                
+                return result
+                
+            except ValueError as e:
+                return {"success": False, "error": str(e)}
+            except Exception as e:
+                return {"success": False, "error": f"Failed to zoom grid region: {e}"}
+        
+        elif name == "reset_grid_zoom":
+            _grid_config["region"] = {"x_min": 0.0, "x_max": 1.0, "y_min": 0.0, "y_max": 1.0}
+            
+            # Fit camera to show all
+            try:
+                import FreeCADGui
+                from PySide2 import QtWidgets
+                
+                if FreeCADGui.ActiveDocument and FreeCADGui.ActiveDocument.ActiveView:
+                    FreeCADGui.ActiveDocument.ActiveView.fitAll()
+                    QtWidgets.QApplication.processEvents()
+            except:
+                pass
+            
+            # Capture with reset grid
+            screenshot = capture_with_grid_and_labels()
+            
+            result = {
+                "success": True,
+                "message": "Grid zoom reset to full view."
+            }
+            if screenshot:
+                result["screenshot"] = screenshot
+            
+            return result
+        
+        elif name == "select_point":
+            try:
+                import FreeCADGui
+                import Part
+                from PySide2 import QtWidgets
+                
+                grid_cell = arguments.get("grid_cell", "A1")
+                offset_x = arguments.get("offset_x", 0.5)
+                offset_y = arguments.get("offset_y", 0.5)
+                
+                # Parse grid cell
+                col, row = parse_grid_cell(grid_cell)
+                
+                cols = _grid_config["columns"]
+                rows = _grid_config["rows"]
+                
+                if col < 0 or col >= cols or row < 0 or row >= rows:
+                    return {"success": False, "error": f"Invalid grid cell: {grid_cell}. Use A1-{chr(ord('A')+cols-1)}{rows}"}
+                
+                if FreeCADGui.ActiveDocument is None:
+                    return {"success": False, "error": "No active document with view"}
+                
+                view = FreeCADGui.ActiveDocument.ActiveView
+                if view is None:
+                    return {"success": False, "error": "No active view"}
+                
+                # Get viewport size
+                try:
+                    view_size = view.getSize()
+                    view_width, view_height = view_size[0], view_size[1]
+                except:
+                    view_width, view_height = 800, 600
+                
+                # Calculate pixel position (respecting grid region/zoom)
+                region = _grid_config["region"]
+                
+                # Normalized position within current grid region
+                norm_x = region["x_min"] + (col + offset_x) / cols * (region["x_max"] - region["x_min"])
+                norm_y = region["y_min"] + (row + offset_y) / rows * (region["y_max"] - region["y_min"])
+                
+                # Convert to pixel coordinates
+                pixel_x = int(norm_x * view_width)
+                pixel_y = int(norm_y * view_height)
+                
+                # Ray cast from camera through this pixel
+                # Try different methods depending on FreeCAD version
+                point_3d = None
+                
+                try:
+                    # Method 1: getPointOnScreen (older versions)
+                    point_3d = view.getPointOnScreen(pixel_x, pixel_y)
+                except:
+                    pass
+                
+                if point_3d is None:
+                    try:
+                        # Method 2: getObjectInfo
+                        info = view.getObjectInfo((pixel_x, pixel_y))
+                        if info and "x" in info:
+                            point_3d = FreeCAD.Vector(info["x"], info["y"], info["z"])
+                    except:
+                        pass
+                
+                if point_3d is None:
+                    return {
+                        "success": False,
+                        "error": f"No surface at grid cell {grid_cell}. Try a different cell or adjust view."
+                    }
+                
+                # Create marker sphere
+                _point_counter += 1
+                point_id = f"point_{_point_counter}"
+                
+                marker_radius = estimate_marker_size()
+                color_idx = (_point_counter - 1) % len(_marker_colors)
+                color = _marker_colors[color_idx]
+                
+                if doc is None:
+                    doc = FreeCAD.ActiveDocument
+                
+                marker = doc.addObject("Part::Sphere", f"Marker_{point_id}")
+                marker.Radius = marker_radius
+                marker.Placement.Base = point_3d
+                doc.recompute()
+                
+                # Set marker appearance
+                if hasattr(marker, "ViewObject") and marker.ViewObject:
+                    marker.ViewObject.ShapeColor = color
+                    marker.ViewObject.Transparency = 0
+                
+                QtWidgets.QApplication.processEvents()
+                
+                # Store in pending points
+                _pending_points[point_id] = {
+                    "coords": point_3d,
+                    "marker": marker,
+                    "grid_cell": grid_cell
+                }
+                
+                # Capture screenshot with grid and labels
+                screenshot = capture_with_grid_and_labels()
+                
+                result = {
+                    "success": True,
+                    "point_id": point_id,
+                    "grid_cell": grid_cell,
+                    "coordinates": {
+                        "x": round(point_3d.x, 3),
+                        "y": round(point_3d.y, 3),
+                        "z": round(point_3d.z, 3)
+                    },
+                    "status": "pending_confirmation",
+                    "message": f"Point placed at {point_id}. Call confirm_point('{point_id}') to lock it in, or clear_point('{point_id}') to remove."
+                }
+                if screenshot:
+                    result["screenshot"] = screenshot
+                
+                return result
+                
+            except ValueError as e:
+                return {"success": False, "error": str(e)}
+            except Exception as e:
+                return {"success": False, "error": f"Failed to select point: {e}"}
+        
+        elif name == "confirm_point":
+            point_id = arguments.get("point_id")
+            if not point_id:
+                return {"success": False, "error": "point_id is required"}
+            
+            if point_id not in _pending_points:
+                if point_id in _confirmed_points:
+                    return {"success": False, "error": f"Point {point_id} is already confirmed"}
+                return {"success": False, "error": f"Point {point_id} not found in pending points"}
+            
+            # Move from pending to confirmed
+            point_info = _pending_points.pop(point_id)
+            _confirmed_points[point_id] = point_info
+            
+            coords = point_info["coords"]
+            
+            return {
+                "success": True,
+                "point_id": point_id,
+                "status": "confirmed",
+                "coordinates": {
+                    "x": round(coords.x, 3),
+                    "y": round(coords.y, 3),
+                    "z": round(coords.z, 3)
+                },
+                "message": f"Point {point_id} confirmed. You can now use it in measure_distance."
+            }
+        
+        elif name == "clear_point":
+            point_id = arguments.get("point_id")
+            if not point_id:
+                return {"success": False, "error": "point_id is required"}
+            
+            cleared = []
+            
+            if point_id == "all":
+                # Clear all points
+                for pid in list(_pending_points.keys()):
+                    info = _pending_points.pop(pid)
+                    if info.get("marker"):
+                        try:
+                            doc.removeObject(info["marker"].Name)
+                        except:
+                            pass
+                    cleared.append(pid)
+                
+                for pid in list(_confirmed_points.keys()):
+                    info = _confirmed_points.pop(pid)
+                    if info.get("marker"):
+                        try:
+                            doc.removeObject(info["marker"].Name)
+                        except:
+                            pass
+                    cleared.append(pid)
+            else:
+                # Clear specific point
+                if point_id in _pending_points:
+                    info = _pending_points.pop(point_id)
+                    if info.get("marker"):
+                        try:
+                            doc.removeObject(info["marker"].Name)
+                        except:
+                            pass
+                    cleared.append(point_id)
+                elif point_id in _confirmed_points:
+                    info = _confirmed_points.pop(point_id)
+                    if info.get("marker"):
+                        try:
+                            doc.removeObject(info["marker"].Name)
+                        except:
+                            pass
+                    cleared.append(point_id)
+                else:
+                    return {"success": False, "error": f"Point {point_id} not found"}
+            
+            if doc:
+                doc.recompute()
+            
+            return {"success": True, "cleared": cleared}
+        
+        elif name == "list_points":
+            points = []
+            
+            for pid, info in _pending_points.items():
+                coords = info.get("coords")
+                points.append({
+                    "point_id": pid,
+                    "status": "pending",
+                    "grid_cell": info.get("grid_cell"),
+                    "coordinates": {
+                        "x": round(coords.x, 3),
+                        "y": round(coords.y, 3),
+                        "z": round(coords.z, 3)
+                    } if coords else None
+                })
+            
+            for pid, info in _confirmed_points.items():
+                coords = info.get("coords")
+                points.append({
+                    "point_id": pid,
+                    "status": "confirmed",
+                    "grid_cell": info.get("grid_cell"),
+                    "coordinates": {
+                        "x": round(coords.x, 3),
+                        "y": round(coords.y, 3),
+                        "z": round(coords.z, 3)
+                    } if coords else None
+                })
+            
+            return {
+                "success": True,
+                "points": points,
+                "pending_count": len(_pending_points),
+                "confirmed_count": len(_confirmed_points)
+            }
+        
+        elif name == "measure_distance":
+            point_a_id = arguments.get("point_a")
+            point_b_id = arguments.get("point_b")
+            
+            if not point_a_id or not point_b_id:
+                return {"success": False, "error": "Both point_a and point_b are required"}
+            
+            if point_a_id not in _confirmed_points:
+                return {"success": False, "error": f"Point {point_a_id} not found or not confirmed"}
+            if point_b_id not in _confirmed_points:
+                return {"success": False, "error": f"Point {point_b_id} not found or not confirmed"}
+            
+            try:
+                import Part
+                
+                p1 = _confirmed_points[point_a_id]["coords"]
+                p2 = _confirmed_points[point_b_id]["coords"]
+                
+                # Calculate distance
+                distance = p1.distanceToPoint(p2)
+                
+                # Create visual line between points
+                if doc is None:
+                    doc = FreeCAD.ActiveDocument
+                
+                line_name = f"Measurement_{point_a_id}_{point_b_id}"
+                line_shape = Part.makeLine(p1, p2)
+                line_obj = doc.addObject("Part::Feature", line_name)
+                line_obj.Shape = line_shape
+                doc.recompute()
+                
+                # Style the line
+                if hasattr(line_obj, "ViewObject") and line_obj.ViewObject:
+                    line_obj.ViewObject.LineColor = (1.0, 0.0, 0.0)  # Red
+                    line_obj.ViewObject.LineWidth = 3.0
+                
+                _measurement_objects.append(line_obj)
+                
+                # Capture screenshot
+                screenshot = capture_with_grid_and_labels()
+                
+                result = {
+                    "success": True,
+                    "distance_mm": round(distance, 4),
+                    "point_a": {
+                        "id": point_a_id,
+                        "coordinates": {"x": round(p1.x, 3), "y": round(p1.y, 3), "z": round(p1.z, 3)}
+                    },
+                    "point_b": {
+                        "id": point_b_id,
+                        "coordinates": {"x": round(p2.x, 3), "y": round(p2.y, 3), "z": round(p2.z, 3)}
+                    },
+                    "measurement_line": line_name
+                }
+                if screenshot:
+                    result["screenshot"] = screenshot
+                
+                return result
+                
+            except Exception as e:
+                return {"success": False, "error": f"Failed to measure distance: {e}"}
+        
+        elif name == "clear_measurements":
+            cleared = []
+            
+            # Clear measurement lines
+            for obj in _measurement_objects:
+                try:
+                    if doc and doc.getObject(obj.Name):
+                        doc.removeObject(obj.Name)
+                        cleared.append(obj.Name)
+                except:
+                    pass
+            _measurement_objects = []
+            
+            # Also clear all points
+            for pid in list(_pending_points.keys()):
+                info = _pending_points.pop(pid)
+                if info.get("marker"):
+                    try:
+                        doc.removeObject(info["marker"].Name)
+                        cleared.append(info["marker"].Name)
+                    except:
+                        pass
+            
+            for pid in list(_confirmed_points.keys()):
+                info = _confirmed_points.pop(pid)
+                if info.get("marker"):
+                    try:
+                        doc.removeObject(info["marker"].Name)
+                        cleared.append(info["marker"].Name)
+                    except:
+                        pass
+            
+            if doc:
+                doc.recompute()
+            
+            return {"success": True, "cleared": cleared}
         
         elif name == "list_tools":
             return {"success": True, "tools": TOOLS}

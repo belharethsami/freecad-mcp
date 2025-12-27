@@ -117,6 +117,8 @@ You should see the shapes appear in FreeCAD's 3D viewport!
 
 ## Available Tools
 
+### Document & Object Tools
+
 | Tool | Description | Required Arguments |
 |------|-------------|-------------------|
 | `list_tools` | List all available tools | none |
@@ -138,6 +140,121 @@ You should see the shapes appear in FreeCAD's 3D viewport!
 | `recompute` | Recompute document | none |
 | `compare_to_stl` | Compare shapes to reference STL | `reference_path`, `tolerance` (optional) |
 | `get_mesh_points` | Export mesh as point cloud | `tessellation` (optional), `sample_rate` (optional) |
+
+### Display Mode Tools
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `set_display_mode` | Change object rendering mode | `object`, `mode` (solid/transparent/wireframe), `transparency` (0-100, optional) |
+| `set_clipping_plane` | Cross-section to reveal internals | `axis` (X/Y/Z), `percent` (0-100), `enabled` (bool) |
+
+### Camera Navigation Tools
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `zoom` | Zoom in/out by percentage | `percent` (>100 = zoom in, <100 = zoom out), `doc` (optional) |
+| `pan` | Pan camera | `x`, `y` (-100 to 100, % of viewport), `doc` (optional) |
+| `set_view` | Set camera to preset angle | `preset` (front/back/top/bottom/left/right/isometric) |
+| `rotate_view` | Rotate camera by angles | `yaw`, `pitch`, `roll` (degrees) |
+| `fit_all` | Fit camera to show all objects | none |
+
+### Measurement Mode Tools
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `start_measurement` | Begin measurement mode (shows 8x6 grid overlay) | none |
+| `end_measurement` | End measurement mode (hides grid) | none |
+| `zoom_grid_region` | Zoom into grid cells for precision | `start_cell` (e.g. "A5"), `size` (2 = 2x2) |
+| `reset_grid_zoom` | Reset grid to full view | none |
+| `select_point` | Place marker at grid cell | `grid_cell` (e.g. "C2"), `offset_x/y` (0-1, optional) |
+| `confirm_point` | Lock in a pending point | `point_id` (e.g. "point_1") |
+| `clear_point` | Remove a point marker | `point_id` (or "all") |
+| `list_points` | List all points with coordinates | none |
+| `measure_distance` | Measure between two confirmed points | `point_a`, `point_b` |
+| `clear_measurements` | Remove all measurement markers/lines | none |
+
+### Measurement Mode
+
+The measurement tools allow you to select arbitrary points on a 3D mesh and measure distances between them. This is especially useful for LLM agents that need to understand dimensions of complex parts.
+
+#### Complete Measurement Workflow
+
+```bash
+# 1. Import an STL to measure
+echo '{"tool":"new_document","arguments":{"name":"Test"}}' | nc localhost 9876
+echo '{"tool":"import_stl","arguments":{"path":"/tmp/target.stl","name":"Target"}}' | nc localhost 9876
+
+# 2. Set to transparent mode to see internal surfaces
+echo '{"tool":"set_display_mode","arguments":{"object":"Target","mode":"transparent","transparency":70}}' | nc localhost 9876
+
+# 3. Enable cross-section clipping to reveal internals (cut at 50% through X axis)
+echo '{"tool":"set_clipping_plane","arguments":{"axis":"X","percent":50,"enabled":true}}' | nc localhost 9876
+
+# 4. Start measurement mode (grid overlay appears)
+echo '{"tool":"start_measurement","arguments":{}}' | nc localhost 9876
+
+# 5. Select first point using grid coordinates
+echo '{"tool":"select_point","arguments":{"grid_cell":"D3"}}' | nc localhost 9876
+
+# 6. Confirm the point
+echo '{"tool":"confirm_point","arguments":{"point_id":"point_1"}}' | nc localhost 9876
+
+# 7. Need more precision? Zoom into a 2x2 grid region
+echo '{"tool":"zoom_grid_region","arguments":{"start_cell":"E4","size":2}}' | nc localhost 9876
+
+# 8. Select second point (now at higher precision)
+echo '{"tool":"select_point","arguments":{"grid_cell":"C3"}}' | nc localhost 9876
+echo '{"tool":"confirm_point","arguments":{"point_id":"point_2"}}' | nc localhost 9876
+
+# 9. Measure the distance
+echo '{"tool":"measure_distance","arguments":{"point_a":"point_1","point_b":"point_2"}}' | nc localhost 9876
+
+# 10. Cleanup
+echo '{"tool":"reset_grid_zoom","arguments":{}}' | nc localhost 9876
+echo '{"tool":"end_measurement","arguments":{}}' | nc localhost 9876
+echo '{"tool":"clear_measurements","arguments":{}}' | nc localhost 9876
+```
+
+#### Grid System
+
+The grid overlay divides the viewport into an 8x6 grid (48 cells):
+
+```
+    A    B    C    D    E    F    G    H
+  +----+----+----+----+----+----+----+----+
+1 |    |    |    |    |    |    |    |    |
+  +----+----+----+----+----+----+----+----+
+2 |    |    |    |    |    |    |    |    |
+  +----+----+----+----+----+----+----+----+
+3 |    | ●  |    |    |    |    |    |    |  ← Point at B3
+  +----+----+----+----+----+----+----+----+
+4 |    |    |    |    |    |    |    |    |
+  +----+----+----+----+----+----+----+----+
+5 |    |    |    |    |    | ●  |    |    |  ← Point at F5
+  +----+----+----+----+----+----+----+----+
+6 |    |    |    |    |    |    |    |    |
+  +----+----+----+----+----+----+----+----+
+```
+
+Use `zoom_grid_region` to zoom into a subset and re-apply the 8x6 grid at higher resolution.
+
+#### Response Example
+
+```json
+{
+  "success": true,
+  "distance_mm": 45.284,
+  "point_a": {
+    "id": "point_1",
+    "coordinates": {"x": 10.5, "y": 20.0, "z": 5.0}
+  },
+  "point_b": {
+    "id": "point_2",
+    "coordinates": {"x": 45.0, "y": 35.0, "z": 15.0}
+  },
+  "screenshot": "iVBORw0KGgoAAAANSUhEUg..."
+}
+```
 
 ### STL Comparison Tool
 
